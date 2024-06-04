@@ -896,7 +896,7 @@ jobs:
 
   build-nodejs-linux: 
     docker: 
-      - image: cimg/base:stable
+      - image: ubuntu-2204:2023.04.2
     steps:
       - checkout
       - attach_workspace:
@@ -905,7 +905,7 @@ jobs:
           name: Install dependencies
           command: |
             sudo apt-get update
-            sudo apt-get install -y g++-12-aarch64-linux-gnu gcc-12-aarch64-linux-gnu
+            sudo apt-get install -y cmake build-essential g++-12-aarch64-linux-gnu gcc-12-aarch64-linux-gnu
       - node/install:
           install-yarn: true
           node-version: "18.16"
