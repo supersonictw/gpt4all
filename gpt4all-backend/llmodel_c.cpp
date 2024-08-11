@@ -20,7 +20,8 @@ struct LLModelWrapper {
     ~LLModelWrapper() { delete llModel; }
 };
 
-llmodel_model llmodel_model_create(const char *model_path) {
+llmodel_model llmodel_model_create(const char *model_path)
+{
     const char *error;
     auto fres = llmodel_model_create2(model_path, "auto", &error);
     if (!fres) {
@@ -29,7 +30,8 @@ llmodel_model llmodel_model_create(const char *model_path) {
     return fres;
 }
 
-static void llmodel_set_error(const char **errptr, const char *message) {
+static void llmodel_set_error(const char **errptr, const char *message)
+{
     thread_local static std::string last_error_message;
     if (errptr) {
         last_error_message = message;
@@ -37,7 +39,8 @@ static void llmodel_set_error(const char **errptr, const char *message) {
     }
 }
 
-llmodel_model llmodel_model_create2(const char *model_path, const char *backend, const char **error) {
+llmodel_model llmodel_model_create2(const char *model_path, const char *backend, const char **error)
+{
     LLModel *llModel;
     try {
         llModel = LLModel::Implementation::construct(model_path, backend);
@@ -51,7 +54,8 @@ llmodel_model llmodel_model_create2(const char *model_path, const char *backend,
     return wrapper;
 }
 
-void llmodel_model_destroy(llmodel_model model) {
+void llmodel_model_destroy(llmodel_model model)
+{
     delete static_cast<LLModelWrapper *>(model);
 }
 
@@ -102,7 +106,7 @@ void llmodel_prompt(llmodel_model model, const char *prompt,
                     const char *prompt_template,
                     llmodel_prompt_callback prompt_callback,
                     llmodel_response_callback response_callback,
-                    llmodel_recalculate_callback recalculate_callback,
+                    bool allow_context_shift,
                     llmodel_prompt_context *ctx,
                     bool special,
                     const char *fake_reply)
@@ -112,9 +116,6 @@ void llmodel_prompt(llmodel_model model, const char *prompt,
     auto response_func = [response_callback](int32_t token_id, const std::string &response) {
         return response_callback(token_id, response.c_str());
     };
-
-    if (size_t(ctx->n_past) < wrapper->promptContext.tokens.size())
-        wrapper->promptContext.tokens.resize(ctx->n_past);
 
     // Copy the C prompt context
     wrapper->promptContext.n_past = ctx->n_past;
@@ -134,13 +135,11 @@ void llmodel_prompt(llmodel_model model, const char *prompt,
     auto *fake_reply_p = fake_reply ? &fake_reply_str : nullptr;
 
     // Call the C++ prompt method
-    wrapper->llModel->prompt(prompt, prompt_template, prompt_callback, response_func, recalculate_callback,
+    wrapper->llModel->prompt(prompt, prompt_template, prompt_callback, response_func, allow_context_shift,
                              wrapper->promptContext, special, fake_reply_p);
 
     // Update the C context by giving access to the wrappers raw pointers to std::vector data
     // which involves no copies
-    ctx->logits = wrapper->promptContext.logits.data();
-    ctx->logits_size = wrapper->promptContext.logits.size();
     ctx->tokens = wrapper->promptContext.tokens.data();
     ctx->tokens_size = wrapper->promptContext.tokens.size();
 
@@ -281,12 +280,6 @@ bool llmodel_gpu_init_gpu_device_by_int(llmodel_model model, int device)
 {
     auto *wrapper = static_cast<LLModelWrapper *>(model);
     return wrapper->llModel->initializeGPUDevice(device);
-}
-
-bool llmodel_has_gpu_device(llmodel_model model)
-{
-    const auto *wrapper = static_cast<LLModelWrapper *>(model);
-    return wrapper->llModel->hasGPUDevice();
 }
 
 const char *llmodel_model_backend_name(llmodel_model model)

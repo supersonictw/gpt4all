@@ -2,6 +2,7 @@
 #define LLMODEL_H
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -13,11 +14,12 @@
 #include <utility>
 #include <vector>
 
+class Dlhandle;
+
 using namespace std::string_literals;
 
 #define LLMODEL_MAX_PROMPT_BATCH 128
 
-class Dlhandle;
 class LLModel {
 public:
     using Token = int32_t;
@@ -57,23 +59,30 @@ public:
             backend(backend), index(index), type(type), heapSize(heapSize), name(std::move(name)),
             vendor(std::move(vendor)) {}
 
-        std::string selectionName() const { return m_backendNames.at(backend) + ": " + name; }
-        std::string reportedName()  const { return name + " (" + m_backendNames.at(backend) + ")"; }
+        std::string selectionName() const
+        {
+            assert(backend == "cuda"s || backend == "kompute"s);
+            return backendName() + ": " + name;
+        }
+
+        std::string backendName() const { return backendIdToName(backend); }
+
+        static std::string backendIdToName(const std::string &backend) { return s_backendNames.at(backend); }
 
         static std::string updateSelectionName(const std::string &name) {
             if (name == "Auto" || name == "CPU" || name == "Metal")
                 return name;
-            auto it = std::find_if(m_backendNames.begin(), m_backendNames.end(), [&name](const auto &entry) {
+            auto it = std::find_if(s_backendNames.begin(), s_backendNames.end(), [&name](const auto &entry) {
                 return name.starts_with(entry.second + ": ");
             });
-            if (it != m_backendNames.end())
+            if (it != s_backendNames.end())
                 return name;
             return "Vulkan: " + name; // previously, there were only Vulkan devices
         }
 
     private:
-        static inline const std::unordered_map<std::string, std::string> m_backendNames {
-            {"cuda", "CUDA"}, {"kompute", "Vulkan"},
+        static inline const std::unordered_map<std::string, std::string> s_backendNames {
+            {"cpu", "CPU"}, {"metal", "Metal"}, {"cuda", "CUDA"}, {"kompute", "Vulkan"},
         };
     };
 
@@ -114,7 +123,6 @@ public:
     };
 
     struct PromptContext {
-        std::vector<float> logits;      // logits of current context
         std::vector<int32_t> tokens;    // current tokens in the context window
         int32_t n_past = 0;             // number of tokens in past conversation
         int32_t n_ctx = 0;              // number of tokens possible in context window
@@ -126,8 +134,7 @@ public:
         int32_t n_batch = 9;
         float   repeat_penalty = 1.10f;
         int32_t repeat_last_n = 64;     // last n tokens to penalize
-        float   contextErase = 0.75f;   // percent of context to erase if we exceed the context window
-        int32_t n_last_batch_tokens = 0;
+        float   contextErase = 0.5f;    // percent of context to erase if we exceed the context window
     };
 
     using ProgressCallback = std::function<bool(float progress)>;
@@ -152,7 +159,7 @@ public:
                         const std::string &promptTemplate,
                         std::function<bool(int32_t)> promptCallback,
                         std::function<bool(int32_t, const std::string&)> responseCallback,
-                        std::function<bool(bool)> recalculateCallback,
+                        bool allowContextShift,
                         PromptContext &ctx,
                         bool special = false,
                         std::string *fakeReply = nullptr);
@@ -196,7 +203,6 @@ public:
         return false;
     }
 
-    virtual bool hasGPUDevice() const { return false; }
     virtual bool usingGPUDevice() const { return false; }
     virtual const char *backendName() const { return "cpu"; }
     virtual const char *gpuDeviceName() const { return nullptr; }
@@ -206,10 +212,12 @@ public:
 protected:
     // These are pure virtual because subclasses need to implement as the default implementation of
     // 'prompt' above calls these functions
-    virtual std::vector<Token> tokenize(PromptContext &ctx, const std::string &str, bool special = false) const = 0;
+    virtual std::vector<Token> tokenize(PromptContext &ctx, const std::string &str, bool special = false) = 0;
+    virtual bool isSpecialToken(Token id) const = 0;
     virtual std::string tokenToString(Token id) const = 0;
     virtual Token sampleToken(PromptContext &ctx) const = 0;
     virtual bool evalTokens(PromptContext &ctx, const std::vector<int32_t> &tokens) const = 0;
+    virtual void shiftContext(PromptContext &promptCtx) = 0;
     virtual int32_t contextLength() const = 0;
     virtual const std::vector<Token> &endTokens() const = 0;
     virtual bool shouldAddBOS() const = 0;
@@ -226,10 +234,6 @@ protected:
         return -1;
     }
 
-    // This is a helper function called from the default implementation of 'prompt' but it can be
-    // shared by all base classes so it isn't virtual
-    void recalculateContext(PromptContext &promptCtx, std::function<bool(bool)> recalculate);
-
     const Implementation *m_implementation = nullptr;
 
     ProgressCallback m_progressCallback;
@@ -241,16 +245,17 @@ protected:
         return true;
     }
 
-    void decodePrompt(std::function<bool(int32_t)> promptCallback,
+    bool decodePrompt(std::function<bool(int32_t)> promptCallback,
                       std::function<bool(int32_t, const std::string&)> responseCallback,
-                      std::function<bool(bool)> recalculateCallback,
+                      bool allowContextShift,
                       PromptContext &promptCtx,
                       std::vector<Token> embd_inp);
     void generateResponse(std::function<bool(int32_t, const std::string&)> responseCallback,
-                          std::function<bool(bool)> recalculateCallback,
+                          bool allowContextShift,
                           PromptContext &promptCtx);
 
-private:
+    Token m_tokenize_last_token = -1; // not serialized
+
     friend class LLMImplementation;
 };
 

@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QThread>
@@ -18,6 +19,8 @@
 #include <QtLogging>
 
 #include <iostream>
+
+using namespace Qt::Literals::StringLiterals;
 
 //#define DEBUG
 
@@ -87,13 +90,13 @@ void ChatAPI::prompt(const std::string &prompt,
                      const std::string &promptTemplate,
                      std::function<bool(int32_t)> promptCallback,
                      std::function<bool(int32_t, const std::string&)> responseCallback,
-                     std::function<bool(bool)> recalculateCallback,
+                     bool allowContextShift,
                      PromptContext &promptCtx,
                      bool special,
                      std::string *fakeReply) {
 
     Q_UNUSED(promptCallback);
-    Q_UNUSED(recalculateCallback);
+    Q_UNUSED(allowContextShift);
     Q_UNUSED(special);
 
     if (!isModelLoaded()) {
@@ -194,10 +197,15 @@ void ChatAPIWorker::request(const QString &apiKey,
     m_ctx = promptCtx;
 
     QUrl apiUrl(m_chat->url());
-    const QString authorization = QString("Bearer %1").arg(apiKey).trimmed();
+    const QString authorization = u"Bearer %1"_s.arg(apiKey).trimmed();
     QNetworkRequest request(apiUrl);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     request.setRawHeader("Authorization", authorization.toUtf8());
+#if defined(DEBUG)
+    qDebug() << "ChatAPI::request"
+             << "API URL: " << apiUrl.toString()
+             << "Authorization: " << authorization.toUtf8();
+#endif
     m_networkManager = new QNetworkAccessManager(this);
     QNetworkReply *reply = m_networkManager->post(request, array);
     connect(qGuiApp, &QCoreApplication::aboutToQuit, reply, &QNetworkReply::abort);
@@ -215,10 +223,28 @@ void ChatAPIWorker::handleFinished()
     }
 
     QVariant response = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
-    Q_ASSERT(response.isValid());
+
+    if (!response.isValid()) {
+        m_chat->callResponse(
+            -1,
+            tr("ERROR: Network error occurred while connecting to the API server")
+                .toStdString()
+        );
+        return;
+    }
+
     bool ok;
     int code = response.toInt(&ok);
     if (!ok || code != 200) {
+        bool isReplyEmpty(reply->readAll().isEmpty());
+        if (isReplyEmpty)
+            m_chat->callResponse(
+                -1,
+                tr("ChatAPIWorker::handleFinished got HTTP Error %1 %2")
+                    .arg(code)
+                    .arg(reply->errorString())
+                    .toStdString()
+            );
         qWarning().noquote() << "ERROR: ChatAPIWorker::handleFinished got HTTP Error" << code << "response:"
                              << reply->errorString();
     }
@@ -235,14 +261,17 @@ void ChatAPIWorker::handleReadyRead()
     }
 
     QVariant response = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
-    Q_ASSERT(response.isValid());
+
+    if (!response.isValid())
+        return;
+
     bool ok;
     int code = response.toInt(&ok);
     if (!ok || code != 200) {
         m_chat->callResponse(
             -1,
-            QString("ERROR: ChatAPIWorker::handleReadyRead got HTTP Error %1 %2: %3")
-                .arg(code).arg(reply->errorString()).arg(reply->readAll()).toStdString()
+            u"ERROR: ChatAPIWorker::handleReadyRead got HTTP Error %1 %2: %3"_s
+                .arg(code).arg(reply->errorString(), reply->readAll()).toStdString()
         );
         emit finished();
         return;
@@ -263,7 +292,7 @@ void ChatAPIWorker::handleReadyRead()
         QJsonParseError err;
         const QJsonDocument document = QJsonDocument::fromJson(jsonData.toUtf8(), &err);
         if (err.error != QJsonParseError::NoError) {
-            m_chat->callResponse(-1, QString("ERROR: ChatAPI responded with invalid json \"%1\"")
+            m_chat->callResponse(-1, u"ERROR: ChatAPI responded with invalid json \"%1\""_s
                                          .arg(err.errorString()).toStdString());
             continue;
         }

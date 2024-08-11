@@ -30,9 +30,9 @@
 
 #ifdef GGML_USE_KOMPUTE
 #   include <ggml-kompute.h>
-#elif GGML_USE_VULKAN
+#elif defined(GGML_USE_VULKAN)
 #   include <ggml-vulkan.h>
-#elif GGML_USE_CUDA
+#elif defined(GGML_USE_CUDA)
 #   include <ggml-cuda.h>
 #endif
 
@@ -51,14 +51,14 @@ static const std::vector<const char *> KNOWN_ARCHES {
     // "grok", -- 314B parameters
     "gpt2",
     // "gptj", -- no inference code
-    // "gptneox", -- no inference code
+    "gptneox",
     "mpt",
     "baichuan",
     "starcoder",
-    // "persimmon", -- CUDA generates garbage
     "refact",
     "bert",
     "nomic-bert",
+    // "jina-bert-v2", -- Assertion `i01 >= 0 && i01 < ne01' failed.
     "bloom",
     "stablelm",
     "qwen",
@@ -72,33 +72,54 @@ static const std::vector<const char *> KNOWN_ARCHES {
     "internlm2",
     // "minicpm", -- CUDA generates garbage
     "gemma",
+    "gemma2",
     "starcoder2",
     // "mamba", -- CUDA missing SSM_CONV
     "xverse",
     "command-r",
     // "dbrx", -- 16x12B parameters
     "olmo",
+    "openelm",
+    // "arctic", -- 10B+128x3.66B parameters
+    "deepseek2",
+    "chatglm",
+    // "bitnet", -- tensor not within file bounds?
+    // "t5", -- seq2seq model
+    "jais",
 };
 
 static const std::vector<const char *> EMBEDDING_ARCHES {
     "bert", "nomic-bert",
 };
 
-static bool is_embedding_arch(const std::string &arch) {
+static bool is_embedding_arch(const std::string &arch)
+{
     return std::find(EMBEDDING_ARCHES.begin(), EMBEDDING_ARCHES.end(), arch) < EMBEDDING_ARCHES.end();
 }
 
-static bool llama_verbose() {
+static bool llama_verbose()
+{
     const char* var = getenv("GPT4ALL_VERBOSE_LLAMACPP");
     return var && *var;
 }
 
-static void llama_log_callback(enum ggml_log_level level, const char *text, void *userdata) {
+static void llama_log_callback(enum ggml_log_level level, const char *text, void *userdata)
+{
     (void)userdata;
     if (llama_verbose() || level <= GGML_LOG_LEVEL_ERROR) {
         fputs(text, stderr);
     }
 }
+
+#ifdef GGML_USE_CUDA
+static void cuda_log_callback(enum ggml_log_level level, const char *text, void *userdata)
+{
+    (void)userdata;
+    if (llama_verbose() || level <= GGML_LOG_LEVEL_WARN) {
+        fputs(text, stderr);
+    }
+}
+#endif
 
 struct gpt_params {
     int32_t seed          = -1;   // RNG seed
@@ -124,9 +145,8 @@ static int llama_sample_top_p_top_k(
         float top_p,
         float min_p,
         float temp,
-        float repeat_penalty,
-        int32_t pos) {
-    auto logits = llama_get_logits_ith(ctx, pos);
+        float repeat_penalty) {
+    auto logits = llama_get_logits_ith(ctx, -1);
     auto n_vocab = llama_n_vocab(llama_get_model(ctx));
     // Populate initial list of all candidates
     std::vector<llama_token_data> candidates;
@@ -147,7 +167,8 @@ static int llama_sample_top_p_top_k(
     return llama_sample_token(ctx, &candidates_p);
 }
 
-const char *get_arch_name(gguf_context *ctx_gguf) {
+const char *get_arch_name(gguf_context *ctx_gguf)
+{
     const int kid = gguf_find_key(ctx_gguf, "general.architecture");
     if (kid == -1)
         throw std::runtime_error("key not found in model: general.architecture");
@@ -159,7 +180,8 @@ const char *get_arch_name(gguf_context *ctx_gguf) {
     return gguf_get_val_str(ctx_gguf, kid);
 }
 
-static gguf_context *load_gguf(const char *fname) {
+static gguf_context *load_gguf(const char *fname)
+{
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
         /*.ctx      = */ nullptr,
@@ -180,7 +202,8 @@ static gguf_context *load_gguf(const char *fname) {
     return ctx;
 }
 
-static int32_t get_arch_key_u32(std::string const &modelPath, std::string const &archKey) {
+static int32_t get_arch_key_u32(std::string const &modelPath, std::string const &archKey)
+{
     int32_t value = -1;
     std::string arch;
 
@@ -237,7 +260,8 @@ struct llama_file_hparams {
     enum llama_ftype ftype = LLAMA_FTYPE_MOSTLY_F16;
 };
 
-size_t LLamaModel::requiredMem(const std::string &modelPath, int n_ctx, int ngl) {
+size_t LLamaModel::requiredMem(const std::string &modelPath, int n_ctx, int ngl)
+{
     // TODO(cebtenzzre): update to GGUF
     (void)ngl; // FIXME(cetenzzre): use this value
     auto fin = std::ifstream(modelPath, std::ios::binary);
@@ -261,7 +285,8 @@ size_t LLamaModel::requiredMem(const std::string &modelPath, int n_ctx, int ngl)
     return filesize + est_kvcache_size;
 }
 
-bool LLamaModel::isModelBlacklisted(const std::string &modelPath) const {
+bool LLamaModel::isModelBlacklisted(const std::string &modelPath) const
+{
     auto * ctx = load_gguf(modelPath.c_str());
     if (!ctx) {
         std::cerr << __func__ << ": failed to load " << modelPath << "\n";
@@ -297,7 +322,8 @@ bool LLamaModel::isModelBlacklisted(const std::string &modelPath) const {
     return res;
 }
 
-bool LLamaModel::isEmbeddingModel(const std::string &modelPath) const {
+bool LLamaModel::isEmbeddingModel(const std::string &modelPath) const
+{
     bool result = false;
     std::string arch;
 
@@ -362,6 +388,11 @@ bool LLamaModel::loadModel(const std::string &modelPath, int n_ctx, int ngl)
         d_ptr->model_params.main_gpu = d_ptr->device;
         d_ptr->model_params.n_gpu_layers = ngl;
         d_ptr->model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    } else {
+#ifdef GGML_USE_CUDA
+        std::cerr << "Llama ERROR: CUDA loadModel was called without a device\n";
+        return false;
+#endif // GGML_USE_CUDA
     }
 #elif defined(GGML_USE_METAL)
     (void)ngl;
@@ -374,15 +405,17 @@ bool LLamaModel::loadModel(const std::string &modelPath, int n_ctx, int ngl)
     // always fully offload on Metal
     // TODO(cebtenzzre): use this parameter to allow using more than 53% of system RAM to load a model
     d_ptr->model_params.n_gpu_layers = 100;
-#else
+#else // !KOMPUTE && !VULKAN && !CUDA && !METAL
     (void)ngl;
 #endif
 
-    d_ptr->model = llama_load_model_from_file_gpt4all(modelPath.c_str(), &d_ptr->model_params);
+    d_ptr->model = llama_load_model_from_file(modelPath.c_str(), d_ptr->model_params);
     if (!d_ptr->model) {
         fflush(stdout);
+#ifndef GGML_USE_CUDA
         d_ptr->device = -1;
         d_ptr->deviceName.clear();
+#endif
         std::cerr << "LLAMA ERROR: failed to load model from " << modelPath << std::endl;
         return false;
     }
@@ -425,8 +458,10 @@ bool LLamaModel::loadModel(const std::string &modelPath, int n_ctx, int ngl)
         std::cerr << "LLAMA ERROR: failed to init context for model " <<  modelPath << std::endl;
         llama_free_model(d_ptr->model);
         d_ptr->model = nullptr;
+#ifndef GGML_USE_CUDA
         d_ptr->device = -1;
         d_ptr->deviceName.clear();
+#endif
         return false;
     }
 
@@ -453,12 +488,14 @@ bool LLamaModel::loadModel(const std::string &modelPath, int n_ctx, int ngl)
     return true;
 }
 
-void LLamaModel::setThreadCount(int32_t n_threads) {
+void LLamaModel::setThreadCount(int32_t n_threads)
+{
     d_ptr->n_threads = n_threads;
     llama_set_n_threads(d_ptr->ctx, n_threads, n_threads);
 }
 
-int32_t LLamaModel::threadCount() const {
+int32_t LLamaModel::threadCount() const
+{
     return d_ptr->n_threads;
 }
 
@@ -491,24 +528,34 @@ size_t LLamaModel::restoreState(const uint8_t *src)
     return llama_set_state_data(d_ptr->ctx, const_cast<uint8_t*>(src));
 }
 
-std::vector<LLModel::Token> LLamaModel::tokenize(PromptContext &ctx, const std::string &str, bool special) const
+std::vector<LLModel::Token> LLamaModel::tokenize(PromptContext &ctx, const std::string &str, bool special)
 {
-    const bool wantBOS = ctx.n_past == 0 && ctx.tokens.empty();
-    const bool useBOS = wantBOS && shouldAddBOS();
-    auto strCat = wantBOS && !special ? " " + str : str; // insert leading space ourselves, llama.cpp fork doesn't anymore
-    std::vector<LLModel::Token> fres(strCat.size()+4);
-    auto fres_len = llama_tokenize(d_ptr->model, strCat.c_str(), strCat.length(), fres.data(), fres.size(), useBOS, special);
+    bool atStart = m_tokenize_last_token == -1;
+    bool insertSpace = atStart || isSpecialToken(m_tokenize_last_token);
+    std::vector<LLModel::Token> fres(str.length() + 4);
+    int32_t fres_len = llama_tokenize_gpt4all(
+        d_ptr->model, str.c_str(), str.length(), fres.data(), fres.size(), /*add_special*/ atStart,
+        /*parse_special*/ special, /*insert_space*/ insertSpace
+    );
     fres.resize(fres_len);
+    if (fres_len)
+        m_tokenize_last_token = fres.back();
     return fres;
+}
+
+bool LLamaModel::isSpecialToken(Token id) const
+{
+    return llama_token_get_attr(d_ptr->model, id)
+        & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN);
 }
 
 std::string LLamaModel::tokenToString(Token id) const
 {
     std::vector<char> result(8, 0);
-    const int n_tokens = llama_token_to_piece(d_ptr->model, id, result.data(), result.size(), false);
+    const int n_tokens = llama_token_to_piece(d_ptr->model, id, result.data(), result.size(), 0, true);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
-        int check = llama_token_to_piece(d_ptr->model, id, result.data(), result.size(), false);
+        int check = llama_token_to_piece(d_ptr->model, id, result.data(), result.size(), 0, true);
         GGML_ASSERT(check == -n_tokens);
     }
     else {
@@ -524,7 +571,7 @@ LLModel::Token LLamaModel::sampleToken(PromptContext &promptCtx) const
     return llama_sample_top_p_top_k(d_ptr->ctx,
         promptCtx.tokens.data() + promptCtx.tokens.size() - n_prev_toks,
         n_prev_toks, promptCtx.top_k, promptCtx.top_p, promptCtx.min_p, promptCtx.temp,
-        promptCtx.repeat_penalty, promptCtx.n_last_batch_tokens - 1);
+        promptCtx.repeat_penalty);
 }
 
 bool LLamaModel::evalTokens(PromptContext &ctx, const std::vector<int32_t> &tokens) const
@@ -534,7 +581,6 @@ bool LLamaModel::evalTokens(PromptContext &ctx, const std::vector<int32_t> &toke
     llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
 
     batch.n_tokens = tokens.size();
-    ctx.n_last_batch_tokens = tokens.size();
 
     for (int32_t i = 0; i < batch.n_tokens; i++) {
         batch.token   [i] = tokens[i];
@@ -552,6 +598,30 @@ bool LLamaModel::evalTokens(PromptContext &ctx, const std::vector<int32_t> &toke
     return res == 0;
 }
 
+void LLamaModel::shiftContext(PromptContext &promptCtx)
+{
+    // infinite text generation via context shifting
+
+    // erase up to n_ctx*contextErase tokens
+    int n_keep = shouldAddBOS();
+    int n_past = promptCtx.n_past;
+    int n_discard = std::min(n_past - n_keep, int(promptCtx.n_ctx * promptCtx.contextErase));
+
+    assert(n_discard > 0);
+    if (n_discard <= 0)
+        return;
+
+    std::cerr << "Llama: context full, swapping: n_past = " << n_past << ", n_keep = " << n_keep
+              << ", n_discard = " << n_discard << "\n";
+
+    // erase the first n_discard tokens from the context
+    llama_kv_cache_seq_rm (d_ptr->ctx, 0, n_keep,             n_keep + n_discard);
+    llama_kv_cache_seq_add(d_ptr->ctx, 0, n_keep + n_discard, n_past,             -n_discard);
+
+    promptCtx.tokens.erase(promptCtx.tokens.begin() + n_keep, promptCtx.tokens.begin() + n_keep + n_discard);
+    promptCtx.n_past = promptCtx.tokens.size();
+}
+
 int32_t LLamaModel::contextLength() const
 {
     return llama_n_ctx(d_ptr->ctx);
@@ -564,10 +634,7 @@ const std::vector<LLModel::Token> &LLamaModel::endTokens() const
 
 bool LLamaModel::shouldAddBOS() const
 {
-    int add_bos = llama_add_bos_token(d_ptr->model);
-    if (add_bos != -1) { return add_bos; }
-    auto vocab_type = llama_vocab_type(d_ptr->model);
-    return vocab_type == LLAMA_VOCAB_TYPE_SPM || vocab_type == LLAMA_VOCAB_TYPE_WPM;
+    return llama_add_bos_token(d_ptr->model);
 }
 
 int32_t LLamaModel::maxContextLength(std::string const &modelPath) const
@@ -581,7 +648,8 @@ int32_t LLamaModel::layerCount(std::string const &modelPath) const
 }
 
 #ifdef GGML_USE_VULKAN
-static const char *getVulkanVendorName(uint32_t vendorID) {
+static const char *getVulkanVendorName(uint32_t vendorID)
+{
     switch (vendorID) {
         case 0x10DE: return "nvidia";
         case 0x1002: return "amd";
@@ -711,41 +779,30 @@ bool LLamaModel::initializeGPUDevice(int device, std::string *unavail_reason) co
 #endif
 }
 
-bool LLamaModel::hasGPUDevice() const
-{
-#if defined(GGML_USE_KOMPUTE) || defined(GGML_USE_VULKAN) || defined(GGML_USE_CUDA)
-    return d_ptr->device != -1;
-#else
-    return false;
-#endif
-}
-
 bool LLamaModel::usingGPUDevice() const
 {
-    bool hasDevice;
+    if (!d_ptr->model)
+        return false;
 
+    bool usingGPU = llama_model_using_gpu(d_ptr->model);
 #ifdef GGML_USE_KOMPUTE
-    hasDevice = hasGPUDevice() && d_ptr->model_params.n_gpu_layers > 0;
-    assert(!hasDevice || ggml_vk_has_device());
-#elif defined(GGML_USE_VULKAN) || defined(GGML_USE_CUDA)
-    hasDevice = hasGPUDevice() && d_ptr->model_params.n_gpu_layers > 0;
-#elif defined(GGML_USE_METAL)
-    hasDevice = true;
-#else
-    hasDevice = false;
+    assert(!usingGPU || ggml_vk_has_device());
 #endif
-
-    return hasDevice;
+    return usingGPU;
 }
 
-const char *LLamaModel::backendName() const {
+const char *LLamaModel::backendName() const
+{
     return d_ptr->backend_name;
 }
 
-const char *LLamaModel::gpuDeviceName() const {
+const char *LLamaModel::gpuDeviceName() const
+{
     if (usingGPUDevice()) {
 #if defined(GGML_USE_KOMPUTE) || defined(GGML_USE_VULKAN) || defined(GGML_USE_CUDA)
         return d_ptr->deviceName.c_str();
+#elif defined(GGML_USE_METAL)
+        return "Metal";
 #endif
     }
     return nullptr;
@@ -768,13 +825,15 @@ void llama_batch_add(
     batch.n_tokens++;
 }
 
-static void batch_add_seq(llama_batch &batch, const std::vector<LLModel::Token> &tokens, int seq_id) {
+static void batch_add_seq(llama_batch &batch, const std::vector<LLModel::Token> &tokens, int seq_id)
+{
     for (unsigned i = 0; i < tokens.size(); i++) {
         llama_batch_add(batch, tokens[i], i, { seq_id }, i == tokens.size() - 1);
     }
 }
 
-size_t LLamaModel::embeddingSize() const {
+size_t LLamaModel::embeddingSize() const
+{
     return llama_n_embd(d_ptr->model);
 }
 
@@ -894,12 +953,14 @@ void LLamaModel::embed(
 // MD5 hash of "nomic empty"
 static const char EMPTY_PLACEHOLDER[] = "24df574ea1c998de59d5be15e769658e";
 
-auto product(double a) -> std::function<double(double)> {
+auto product(double a) -> std::function<double(double)>
+{
     return [a](double b) { return a * b; };
 }
 
 template <typename T>
-double getL2NormScale(T *start, T *end) {
+double getL2NormScale(T *start, T *end)
+{
     double magnitude = std::sqrt(std::inner_product(start, end, start, 0.0));
     return 1.0 / std::max(magnitude, 1e-12);
 }
@@ -915,7 +976,7 @@ void LLamaModel::embedInternal(
     const llama_token bos_token = llama_token_bos(d_ptr->model);
     const llama_token eos_token = llama_token_eos(d_ptr->model);
 
-    bool useBOS = shouldAddBOS();
+    bool useBOS = llama_add_bos_token(d_ptr->model);
     bool useEOS = llama_vocab_type(d_ptr->model) == LLAMA_VOCAB_TYPE_WPM;
 
     // no EOS, optional BOS
@@ -923,13 +984,16 @@ void LLamaModel::embedInternal(
         if (!text.empty() && text[0] != ' ') {
             text = ' ' + text; // normalize for SPM - our fork of llama.cpp doesn't add a space prefix
         }
-        wantBOS &= useBOS;
 
         tokens.resize(text.length()+4);
-        int32_t n_tokens = llama_tokenize(d_ptr->model, text.c_str(), text.length(), tokens.data(), tokens.size(), wantBOS, false);
+        int32_t n_tokens = llama_tokenize_gpt4all(
+            d_ptr->model, text.c_str(), text.length(), tokens.data(), tokens.size(), /*add_special*/ wantBOS,
+            /*parse_special*/ false, /*insert_space*/ false
+        );
         if (n_tokens) {
             (void)eos_token;
-            assert((useEOS && wantBOS) == (eos_token != -1 && tokens[n_tokens - 1] == eos_token));
+            (void)useBOS;
+            assert((useEOS && wantBOS && useBOS) == (eos_token != -1 && tokens[n_tokens - 1] == eos_token));
             if (useEOS && wantBOS)
                 n_tokens--; // erase EOS/SEP
         }
@@ -985,14 +1049,14 @@ void LLamaModel::embedInternal(
     size_t totalTokens = 0;
     for (unsigned i = 0; i < inputs.size(); i++) {
         auto &input = inputs[i];
-        for (auto it = input.begin(); it < input.end(); it += max_len) {
-            if (it > input.begin()) { it -= chunkOverlap; }
-            auto end = std::min(it + max_len, input.end());
+        for (unsigned j = 0; j < input.size(); j += max_len) {
+            if (j) { j -= chunkOverlap; }
+            unsigned end = std::min(j + max_len, unsigned(input.size()));
             batches.push_back({ i, {} });
             auto &batch = batches.back().batch;
             batch = prefixTokens;
-            batch.insert(batch.end(), it, end);
-            totalTokens += end - it;
+            batch.insert(batch.end(), input.begin() + j, input.begin() + end);
+            totalTokens += end - j;
             batch.push_back(eos_token);
             if (!doMean) { break; /* limit text to one chunk */ }
         }
@@ -1107,19 +1171,23 @@ void LLamaModel::embedInternal(
 #endif
 
 extern "C" {
-DLL_EXPORT bool is_g4a_backend_model_implementation() {
+DLL_EXPORT bool is_g4a_backend_model_implementation()
+{
     return true;
 }
 
-DLL_EXPORT const char *get_model_type() {
+DLL_EXPORT const char *get_model_type()
+{
     return modelType_;
 }
 
-DLL_EXPORT const char *get_build_variant() {
+DLL_EXPORT const char *get_build_variant()
+{
     return GGML_BUILD_VARIANT;
 }
 
-DLL_EXPORT char *get_file_arch(const char *fname) {
+DLL_EXPORT char *get_file_arch(const char *fname)
+{
     char *arch = nullptr;
     std::string archStr;
 
@@ -1144,12 +1212,17 @@ cleanup:
     return arch;
 }
 
-DLL_EXPORT bool is_arch_supported(const char *arch) {
+DLL_EXPORT bool is_arch_supported(const char *arch)
+{
     return std::find(KNOWN_ARCHES.begin(), KNOWN_ARCHES.end(), std::string(arch)) < KNOWN_ARCHES.end();
 }
 
-DLL_EXPORT LLModel *construct() {
+DLL_EXPORT LLModel *construct()
+{
     llama_log_set(llama_log_callback, nullptr);
+#ifdef GGML_USE_CUDA
+    ggml_backend_cuda_log_set_callback(cuda_log_callback, nullptr);
+#endif
     return new LLamaModel;
 }
 }

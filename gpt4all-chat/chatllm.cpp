@@ -2,7 +2,6 @@
 
 #include "chat.h"
 #include "chatapi.h"
-#include "database.h"
 #include "localdocs.h"
 #include "mysettings.h"
 #include "network.h"
@@ -14,11 +13,10 @@
 #include <QIODevice>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QList>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QSet>
-#include <QVariantMap>
+#include <QStringList>
 #include <QWaitCondition>
 #include <Qt>
 #include <QtLogging>
@@ -30,13 +28,16 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
+
+using namespace Qt::Literals::StringLiterals;
 
 //#define DEBUG
 //#define DEBUG_MODEL_LOADING
 
-#define GPTJ_INTERNAL_STATE_VERSION 0
+#define GPTJ_INTERNAL_STATE_VERSION  0 // GPT-J is gone but old chats still use this
 #define LLAMA_INTERNAL_STATE_VERSION 0
 
 class LLModelStore {
@@ -91,11 +92,17 @@ void LLModelStore::destroy()
     m_availableModel.reset();
 }
 
+void LLModelInfo::resetModel(ChatLLM *cllm, LLModel *model) {
+    this->model.reset(model);
+    fallbackReason.reset();
+    emit cllm->loadedModelInfoChanged();
+}
+
 ChatLLM::ChatLLM(Chat *parent, bool isServer)
     : QObject{nullptr}
     , m_promptResponseTokens(0)
     , m_promptTokens(0)
-    , m_isRecalc(false)
+    , m_restoringFromText(false)
     , m_shouldBeLoaded(false)
     , m_forceUnloadModel(false)
     , m_markedForDeletion(false)
@@ -139,7 +146,7 @@ void ChatLLM::destroy()
     // The only time we should have a model loaded here is on shutdown
     // as we explicitly unload the model in all other circumstances
     if (isModelLoaded()) {
-        m_llModelInfo.model.reset();
+        m_llModelInfo.resetModel(this);
     }
 }
 
@@ -182,7 +189,7 @@ bool ChatLLM::loadDefaultModel()
 {
     ModelInfo defaultModel = ModelList::globalInstance()->defaultModelInfo();
     if (defaultModel.filename().isEmpty()) {
-        emit modelLoadingError(QString("Could not find any model to load"));
+        emit modelLoadingError(u"Could not find any model to load"_qs);
         return false;
     }
     return loadModel(defaultModel);
@@ -206,7 +213,7 @@ void ChatLLM::trySwitchContextOfLoadedModel(const ModelInfo &modelInfo)
     QString filePath = modelInfo.dirpath + modelInfo.filename();
     QFileInfo fileInfo(filePath);
 
-    m_llModelInfo = LLModelStore::globalInstance()->acquireModel();
+    acquireModel();
 #if defined(DEBUG_MODEL_LOADING)
         qDebug() << "acquired model from store" << m_llmThread.objectName() << m_llModelInfo.model.get();
 #endif
@@ -249,8 +256,6 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
     // reset status
     emit modelLoadingPercentageChanged(std::numeric_limits<float>::min()); // small non-zero positive value
     emit modelLoadingError("");
-    emit reportFallbackReason("");
-    emit reportDevice("");
     m_pristineLoadedState = false;
 
     QString filePath = modelInfo.dirpath + modelInfo.filename();
@@ -263,12 +268,12 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
 #if defined(DEBUG_MODEL_LOADING)
         qDebug() << "already acquired model deleted" << m_llmThread.objectName() << m_llModelInfo.model.get();
 #endif
-        m_llModelInfo.model.reset();
+        m_llModelInfo.resetModel(this);
     } else if (!m_isServer) {
         // This is a blocking call that tries to retrieve the model we need from the model store.
         // If it succeeds, then we just have to restore state. If the store has never had a model
         // returned to it, then the modelInfo.model pointer should be null which will happen on startup
-        m_llModelInfo = LLModelStore::globalInstance()->acquireModel();
+        acquireModel();
 #if defined(DEBUG_MODEL_LOADING)
         qDebug() << "acquired model from store" << m_llmThread.objectName() << m_llModelInfo.model.get();
 #endif
@@ -294,7 +299,7 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
             setModelInfo(modelInfo);
             Q_ASSERT(!m_modelInfo.filename().isEmpty());
             if (m_modelInfo.filename().isEmpty())
-                emit modelLoadingError(QString("Modelinfo is left null for %1").arg(modelInfo.filename()));
+                emit modelLoadingError(u"Modelinfo is left null for %1"_s.arg(modelInfo.filename()));
             else
                 processSystemPrompt();
             return true;
@@ -303,7 +308,7 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
 #if defined(DEBUG_MODEL_LOADING)
             qDebug() << "deleting model" << m_llmThread.objectName() << m_llModelInfo.model.get();
 #endif
-            m_llModelInfo.model.reset();
+            m_llModelInfo.resetModel(this);
         }
     }
 
@@ -317,6 +322,7 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
         QVariantMap modelLoadProps;
         if (modelInfo.isOnline) {
             QString apiKey;
+            QString requestUrl;
             QString modelName;
             {
                 QFile file(filePath);
@@ -327,190 +333,28 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
                 QJsonObject obj = doc.object();
                 apiKey = obj["apiKey"].toString();
                 modelName = obj["modelName"].toString();
+                if (modelInfo.isCompatibleApi) {
+                    QString baseUrl(obj["baseUrl"].toString());
+                    QUrl apiUrl(QUrl::fromUserInput(baseUrl));
+                    if (!Network::isHttpUrlValid(apiUrl)) {
+                        return false;
+                    }
+                    QString currentPath(apiUrl.path());
+                    QString suffixPath("%1/chat/completions");
+                    apiUrl.setPath(suffixPath.arg(currentPath));
+                    requestUrl = apiUrl.toString();
+                } else {
+                    requestUrl = modelInfo.url();
+                }
             }
             m_llModelType = LLModelType::API_;
             ChatAPI *model = new ChatAPI();
             model->setModelName(modelName);
-            model->setRequestURL(modelInfo.url());
+            model->setRequestURL(requestUrl);
             model->setAPIKey(apiKey);
-            m_llModelInfo.model.reset(model);
-        } else {
-            QElapsedTimer modelLoadTimer;
-            modelLoadTimer.start();
-
-            auto requestedDevice = MySettings::globalInstance()->device();
-            auto n_ctx = MySettings::globalInstance()->modelContextLength(modelInfo);
-            m_ctx.n_ctx = n_ctx;
-            auto ngl = MySettings::globalInstance()->modelGpuLayers(modelInfo);
-
-            std::string backend = "auto";
-#ifdef Q_OS_MAC
-            if (requestedDevice == "CPU") {
-                backend = "cpu";
-            } else if (m_forceMetal) {
-#ifdef __aarch64__
-                backend = "metal";
-#endif
-            }
-#else // !defined(Q_OS_MAC)
-            if (requestedDevice.startsWith("CUDA: "))
-                backend = "cuda";
-#endif
-
-            QString constructError;
-            m_llModelInfo.model.reset();
-            try {
-                auto *model = LLModel::Implementation::construct(filePath.toStdString(), backend, n_ctx);
-                m_llModelInfo.model.reset(model);
-            } catch (const LLModel::MissingImplementationError &e) {
-                modelLoadProps.insert("error", "missing_model_impl");
-                constructError = e.what();
-            } catch (const LLModel::UnsupportedModelError &e) {
-                modelLoadProps.insert("error", "unsupported_model_file");
-                constructError = e.what();
-            } catch (const LLModel::BadArchError &e) {
-                constructError = e.what();
-                modelLoadProps.insert("error", "unsupported_model_arch");
-                modelLoadProps.insert("model_arch", QString::fromStdString(e.arch()));
-            }
-
-            if (m_llModelInfo.model) {
-                if (m_llModelInfo.model->isModelBlacklisted(filePath.toStdString())) {
-                    static QSet<QString> warned;
-                    auto fname = modelInfo.filename();
-                    if (!warned.contains(fname)) {
-                        emit modelLoadingWarning(QString(
-                            "%1 is known to be broken. Please get a replacement via the download dialog."
-                        ).arg(fname));
-                        warned.insert(fname); // don't warn again until restart
-                    }
-                }
-
-                m_llModelInfo.model->setProgressCallback([this](float progress) -> bool {
-                    progress = std::max(progress, std::numeric_limits<float>::min()); // keep progress above zero
-                    emit modelLoadingPercentageChanged(progress);
-                    return m_shouldBeLoaded;
-                });
-
-                auto approxDeviceMemGB = [](const LLModel::GPUDevice *dev) {
-                    float memGB = dev->heapSize / float(1024 * 1024 * 1024);
-                    return std::floor(memGB * 10.f) / 10.f; // truncate to 1 decimal place
-                };
-
-                std::vector<LLModel::GPUDevice> availableDevices;
-                const LLModel::GPUDevice *defaultDevice = nullptr;
-                {
-                    const size_t requiredMemory = m_llModelInfo.model->requiredMem(filePath.toStdString(), n_ctx, ngl);
-                    availableDevices = m_llModelInfo.model->availableGPUDevices(requiredMemory);
-                    // Pick the best device
-                    // NB: relies on the fact that Kompute devices are listed first
-                    if (!availableDevices.empty() && availableDevices.front().type == 2 /*a discrete gpu*/) {
-                        defaultDevice = &availableDevices.front();
-                        float memGB = defaultDevice->heapSize / float(1024 * 1024 * 1024);
-                        memGB = std::floor(memGB * 10.f) / 10.f; // truncate to 1 decimal place
-                        modelLoadProps.insert("default_device", QString::fromStdString(defaultDevice->name));
-                        modelLoadProps.insert("default_device_mem", approxDeviceMemGB(defaultDevice));
-                    }
-                }
-
-                QString actualDevice("CPU");
-
-#if defined(Q_OS_MAC) && defined(__aarch64__)
-                if (m_llModelInfo.model->implementation().buildVariant() == "metal")
-                    actualDevice = "Metal";
-#else
-                if (requestedDevice != "CPU") {
-                    const auto *device = defaultDevice;
-                    if (requestedDevice != "Auto") {
-                        // Use the selected device
-                        for (const LLModel::GPUDevice &d : availableDevices) {
-                            if (QString::fromStdString(d.selectionName()) == requestedDevice) {
-                                device = &d;
-                                break;
-                            }
-                        }
-                    }
-
-                    std::string unavail_reason;
-                    if (!device) {
-                        // GPU not available
-                    } else if (!m_llModelInfo.model->initializeGPUDevice(device->index, &unavail_reason)) {
-                        emit reportFallbackReason(QString::fromStdString("<br>" + unavail_reason));
-                    } else {
-                        actualDevice = QString::fromStdString(device->reportedName());
-                        modelLoadProps.insert("requested_device_mem", approxDeviceMemGB(device));
-                    }
-                }
-#endif
-
-                // Report which device we're actually using
-                emit reportDevice(actualDevice);
-                bool success = m_llModelInfo.model->loadModel(filePath.toStdString(), n_ctx, ngl);
-
-                if (!m_shouldBeLoaded) {
-                    m_llModelInfo.model.reset();
-                    if (!m_isServer)
-                        LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
-                    m_llModelInfo = LLModelInfo();
-                    emit modelLoadingPercentageChanged(0.0f);
-                    return false;
-                }
-
-                if (actualDevice == "CPU") {
-                    // we asked llama.cpp to use the CPU
-                } else if (!success) {
-                    // llama_init_from_file returned nullptr
-                    emit reportDevice("CPU");
-                    emit reportFallbackReason("<br>GPU loading failed (out of VRAM?)");
-                    modelLoadProps.insert("cpu_fallback_reason", "gpu_load_failed");
-                    success = m_llModelInfo.model->loadModel(filePath.toStdString(), n_ctx, 0);
-
-                    if (!m_shouldBeLoaded) {
-                        m_llModelInfo.model.reset();
-                        if (!m_isServer)
-                            LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
-                        m_llModelInfo = LLModelInfo();
-                        emit modelLoadingPercentageChanged(0.0f);
-                        return false;
-                    }
-                } else if (!m_llModelInfo.model->usingGPUDevice()) {
-                    // ggml_vk_init was not called in llama.cpp
-                    // We might have had to fallback to CPU after load if the model is not possible to accelerate
-                    // for instance if the quantization method is not supported on Vulkan yet
-                    emit reportDevice("CPU");
-                    emit reportFallbackReason("<br>model or quant has no GPU support");
-                    modelLoadProps.insert("cpu_fallback_reason", "gpu_unsupported_model");
-                }
-
-                if (!success) {
-                    m_llModelInfo.model.reset();
-                    if (!m_isServer)
-                        LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
-                    m_llModelInfo = LLModelInfo();
-                    emit modelLoadingError(QString("Could not load model due to invalid model file for %1").arg(modelInfo.filename()));
-                    modelLoadProps.insert("error", "loadmodel_failed");
-                } else {
-                    switch (m_llModelInfo.model->implementation().modelType()[0]) {
-                    case 'L': m_llModelType = LLModelType::LLAMA_; break;
-                    case 'G': m_llModelType = LLModelType::GPTJ_; break;
-                    default:
-                        {
-                            m_llModelInfo.model.reset();
-                            if (!m_isServer)
-                                LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
-                            m_llModelInfo = LLModelInfo();
-                            emit modelLoadingError(QString("Could not determine model type for %1").arg(modelInfo.filename()));
-                        }
-                    }
-
-                    modelLoadProps.insert("$duration", modelLoadTimer.elapsed() / 1000.);
-                }
-            } else {
-                if (!m_isServer)
-                    LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
-                m_llModelInfo = LLModelInfo();
-                emit modelLoadingError(QString("Error loading %1: %2").arg(modelInfo.filename()).arg(constructError));
-            }
+            m_llModelInfo.resetModel(this, model);
+        } else if (!loadNewModel(modelInfo, modelLoadProps)) {
+            return false; // m_shouldBeLoaded became false
         }
 #if defined(DEBUG_MODEL_LOADING)
         qDebug() << "new model" << m_llmThread.objectName() << m_llModelInfo.model.get();
@@ -521,6 +365,7 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
         fflush(stdout);
 #endif
         emit modelLoadingPercentageChanged(isModelLoaded() ? 1.0f : 0.0f);
+        emit loadedModelInfoChanged();
 
         modelLoadProps.insert("requestedDevice", MySettings::globalInstance()->device());
         modelLoadProps.insert("model", modelInfo.filename());
@@ -528,8 +373,8 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
     } else {
         if (!m_isServer)
             LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo)); // release back into the store
-        m_llModelInfo = LLModelInfo();
-        emit modelLoadingError(QString("Could not find file for model %1").arg(modelInfo.filename()));
+        resetModel();
+        emit modelLoadingError(u"Could not find file for model %1"_s.arg(modelInfo.filename()));
     }
 
     if (m_llModelInfo.model) {
@@ -539,12 +384,207 @@ bool ChatLLM::loadModel(const ModelInfo &modelInfo)
     return bool(m_llModelInfo.model);
 }
 
+/* Returns false if the model should no longer be loaded (!m_shouldBeLoaded).
+ * Otherwise returns true, even on error. */
+bool ChatLLM::loadNewModel(const ModelInfo &modelInfo, QVariantMap &modelLoadProps)
+{
+    QElapsedTimer modelLoadTimer;
+    modelLoadTimer.start();
+
+    QString requestedDevice = MySettings::globalInstance()->device();
+    int n_ctx = MySettings::globalInstance()->modelContextLength(modelInfo);
+    m_ctx.n_ctx = n_ctx;
+    int ngl = MySettings::globalInstance()->modelGpuLayers(modelInfo);
+
+    std::string backend = "auto";
+#ifdef Q_OS_MAC
+    if (requestedDevice == "CPU") {
+        backend = "cpu";
+    } else if (m_forceMetal) {
+#ifdef __aarch64__
+        backend = "metal";
+#endif
+    }
+#else // !defined(Q_OS_MAC)
+    if (requestedDevice.startsWith("CUDA: "))
+        backend = "cuda";
+#endif
+
+    QString filePath = modelInfo.dirpath + modelInfo.filename();
+
+    auto construct = [this, &filePath, &modelInfo, &modelLoadProps, n_ctx](std::string const &backend) {
+        QString constructError;
+        m_llModelInfo.resetModel(this);
+        try {
+            auto *model = LLModel::Implementation::construct(filePath.toStdString(), backend, n_ctx);
+            m_llModelInfo.resetModel(this, model);
+        } catch (const LLModel::MissingImplementationError &e) {
+            modelLoadProps.insert("error", "missing_model_impl");
+            constructError = e.what();
+        } catch (const LLModel::UnsupportedModelError &e) {
+            modelLoadProps.insert("error", "unsupported_model_file");
+            constructError = e.what();
+        } catch (const LLModel::BadArchError &e) {
+            constructError = e.what();
+            modelLoadProps.insert("error", "unsupported_model_arch");
+            modelLoadProps.insert("model_arch", QString::fromStdString(e.arch()));
+        }
+
+        if (!m_llModelInfo.model) {
+            if (!m_isServer)
+                LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
+            resetModel();
+            emit modelLoadingError(u"Error loading %1: %2"_s.arg(modelInfo.filename(), constructError));
+            return false;
+        }
+
+        m_llModelInfo.model->setProgressCallback([this](float progress) -> bool {
+            progress = std::max(progress, std::numeric_limits<float>::min()); // keep progress above zero
+            emit modelLoadingPercentageChanged(progress);
+            return m_shouldBeLoaded;
+        });
+        return true;
+    };
+
+    if (!construct(backend))
+        return true;
+
+    if (m_llModelInfo.model->isModelBlacklisted(filePath.toStdString())) {
+        static QSet<QString> warned;
+        auto fname = modelInfo.filename();
+        if (!warned.contains(fname)) {
+            emit modelLoadingWarning(
+                u"%1 is known to be broken. Please get a replacement via the download dialog."_s.arg(fname)
+            );
+            warned.insert(fname); // don't warn again until restart
+        }
+    }
+
+    auto approxDeviceMemGB = [](const LLModel::GPUDevice *dev) {
+        float memGB = dev->heapSize / float(1024 * 1024 * 1024);
+        return std::floor(memGB * 10.f) / 10.f; // truncate to 1 decimal place
+    };
+
+    std::vector<LLModel::GPUDevice> availableDevices;
+    const LLModel::GPUDevice *defaultDevice = nullptr;
+    {
+        const size_t requiredMemory = m_llModelInfo.model->requiredMem(filePath.toStdString(), n_ctx, ngl);
+        availableDevices = m_llModelInfo.model->availableGPUDevices(requiredMemory);
+        // Pick the best device
+        // NB: relies on the fact that Kompute devices are listed first
+        if (!availableDevices.empty() && availableDevices.front().type == 2 /*a discrete gpu*/) {
+            defaultDevice = &availableDevices.front();
+            float memGB = defaultDevice->heapSize / float(1024 * 1024 * 1024);
+            memGB = std::floor(memGB * 10.f) / 10.f; // truncate to 1 decimal place
+            modelLoadProps.insert("default_device", QString::fromStdString(defaultDevice->name));
+            modelLoadProps.insert("default_device_mem", approxDeviceMemGB(defaultDevice));
+            modelLoadProps.insert("default_device_backend", QString::fromStdString(defaultDevice->backendName()));
+        }
+    }
+
+    bool actualDeviceIsCPU = true;
+
+#if defined(Q_OS_MAC) && defined(__aarch64__)
+    if (m_llModelInfo.model->implementation().buildVariant() == "metal")
+        actualDeviceIsCPU = false;
+#else
+    if (requestedDevice != "CPU") {
+        const auto *device = defaultDevice;
+        if (requestedDevice != "Auto") {
+            // Use the selected device
+            for (const LLModel::GPUDevice &d : availableDevices) {
+                if (QString::fromStdString(d.selectionName()) == requestedDevice) {
+                    device = &d;
+                    break;
+                }
+            }
+        }
+
+        std::string unavail_reason;
+        if (!device) {
+            // GPU not available
+        } else if (!m_llModelInfo.model->initializeGPUDevice(device->index, &unavail_reason)) {
+            m_llModelInfo.fallbackReason = QString::fromStdString(unavail_reason);
+        } else {
+            actualDeviceIsCPU = false;
+            modelLoadProps.insert("requested_device_mem", approxDeviceMemGB(device));
+        }
+    }
+#endif
+
+    bool success = m_llModelInfo.model->loadModel(filePath.toStdString(), n_ctx, ngl);
+
+    if (!m_shouldBeLoaded) {
+        m_llModelInfo.resetModel(this);
+        if (!m_isServer)
+            LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
+        resetModel();
+        emit modelLoadingPercentageChanged(0.0f);
+        return false;
+    }
+
+    if (actualDeviceIsCPU) {
+        // we asked llama.cpp to use the CPU
+    } else if (!success) {
+        // llama_init_from_file returned nullptr
+        m_llModelInfo.fallbackReason = "GPU loading failed (out of VRAM?)";
+        modelLoadProps.insert("cpu_fallback_reason", "gpu_load_failed");
+
+        // For CUDA, make sure we don't use the GPU at all - ngl=0 still offloads matmuls
+        if (backend == "cuda" && !construct("auto"))
+            return true;
+
+        success = m_llModelInfo.model->loadModel(filePath.toStdString(), n_ctx, 0);
+
+        if (!m_shouldBeLoaded) {
+            m_llModelInfo.resetModel(this);
+            if (!m_isServer)
+                LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
+            resetModel();
+            emit modelLoadingPercentageChanged(0.0f);
+            return false;
+        }
+    } else if (!m_llModelInfo.model->usingGPUDevice()) {
+        // ggml_vk_init was not called in llama.cpp
+        // We might have had to fallback to CPU after load if the model is not possible to accelerate
+        // for instance if the quantization method is not supported on Vulkan yet
+        m_llModelInfo.fallbackReason = "model or quant has no GPU support";
+        modelLoadProps.insert("cpu_fallback_reason", "gpu_unsupported_model");
+    }
+
+    if (!success) {
+        m_llModelInfo.resetModel(this);
+        if (!m_isServer)
+            LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
+        resetModel();
+        emit modelLoadingError(u"Could not load model due to invalid model file for %1"_s.arg(modelInfo.filename()));
+        modelLoadProps.insert("error", "loadmodel_failed");
+        return true;
+    }
+
+    switch (m_llModelInfo.model->implementation().modelType()[0]) {
+    case 'L': m_llModelType = LLModelType::LLAMA_; break;
+    default:
+        {
+            m_llModelInfo.resetModel(this);
+            if (!m_isServer)
+                LLModelStore::globalInstance()->releaseModel(std::move(m_llModelInfo));
+            resetModel();
+            emit modelLoadingError(u"Could not determine model type for %1"_s.arg(modelInfo.filename()));
+        }
+    }
+
+    modelLoadProps.insert("$duration", modelLoadTimer.elapsed() / 1000.);
+    return true;
+};
+
 bool ChatLLM::isModelLoaded() const
 {
     return m_llModelInfo.model && m_llModelInfo.model->isModelLoaded();
 }
 
-std::string remove_leading_whitespace(const std::string& input) {
+std::string remove_leading_whitespace(const std::string& input)
+{
     auto first_non_whitespace = std::find_if(input.begin(), input.end(), [](unsigned char c) {
         return !std::isspace(c);
     });
@@ -555,7 +595,8 @@ std::string remove_leading_whitespace(const std::string& input) {
     return std::string(first_non_whitespace, input.end());
 }
 
-std::string trim_whitespace(const std::string& input) {
+std::string trim_whitespace(const std::string& input)
+{
     auto first_non_whitespace = std::find_if(input.begin(), input.end(), [](unsigned char c) {
         return !std::isspace(c);
     });
@@ -570,6 +611,7 @@ std::string trim_whitespace(const std::string& input) {
     return std::string(first_non_whitespace, last_non_whitespace);
 }
 
+// FIXME(jared): we don't actually have to re-decode the prompt to generate a new response
 void ChatLLM::regenerateResponse()
 {
     // ChatGPT uses a different semantic meaning for n_past than local models. For ChatGPT, the meaning
@@ -617,6 +659,16 @@ void ChatLLM::setModelInfo(const ModelInfo &modelInfo)
     emit modelInfoChanged(modelInfo);
 }
 
+void ChatLLM::acquireModel() {
+    m_llModelInfo = LLModelStore::globalInstance()->acquireModel();
+    emit loadedModelInfoChanged();
+}
+
+void ChatLLM::resetModel() {
+    m_llModelInfo = {};
+    emit loadedModelInfoChanged();
+}
+
 void ChatLLM::modelChangeRequested(const ModelInfo &modelInfo)
 {
     m_shouldBeLoaded = true;
@@ -660,17 +712,6 @@ bool ChatLLM::handleResponse(int32_t token, const std::string &response)
     return !m_stopGenerating;
 }
 
-bool ChatLLM::handleRecalculate(bool isRecalc)
-{
-#if defined(DEBUG)
-    qDebug() << "recalculate" << m_llmThread.objectName() << isRecalc;
-#endif
-    if (m_isRecalc != isRecalc) {
-        m_isRecalc = isRecalc;
-        emit recalcChanged();
-    }
-    return !m_stopGenerating;
-}
 bool ChatLLM::prompt(const QList<QString> &collectionList, const QString &prompt)
 {
     if (m_restoreStateFromText) {
@@ -708,11 +749,15 @@ bool ChatLLM::promptInternal(const QList<QString> &collectionList, const QString
     }
 
     // Augment the prompt template with the results if any
-    QList<QString> docsContext;
-    if (!databaseResults.isEmpty())
-        docsContext.append("### Context:");
-    for (const ResultInfo &info : databaseResults)
-        docsContext.append(info.text);
+    QString docsContext;
+    if (!databaseResults.isEmpty()) {
+        QStringList results;
+        for (const ResultInfo &info : databaseResults)
+            results << u"Collection: %1\nPath: %2\nExcerpt: %3"_s.arg(info.collection, info.path, info.text);
+
+        // FIXME(jared): use a Jinja prompt template instead of hardcoded Alpaca-style localdocs template
+        docsContext = u"### Context:\n%1\n\n"_s.arg(results.join("\n\n"));
+    }
 
     int n_threads = MySettings::globalInstance()->threadCount();
 
@@ -720,7 +765,6 @@ bool ChatLLM::promptInternal(const QList<QString> &collectionList, const QString
     auto promptFunc = std::bind(&ChatLLM::handlePrompt, this, std::placeholders::_1);
     auto responseFunc = std::bind(&ChatLLM::handleResponse, this, std::placeholders::_1,
         std::placeholders::_2);
-    auto recalcFunc = std::bind(&ChatLLM::handleRecalculate, this, std::placeholders::_1);
     emit promptProcessing();
     m_ctx.n_predict = n_predict;
     m_ctx.top_k = top_k;
@@ -740,10 +784,12 @@ bool ChatLLM::promptInternal(const QList<QString> &collectionList, const QString
     m_timer->start();
     if (!docsContext.isEmpty()) {
         auto old_n_predict = std::exchange(m_ctx.n_predict, 0); // decode localdocs context without a response
-        m_llModelInfo.model->prompt(docsContext.join("\n").toStdString(), "%1", promptFunc, responseFunc, recalcFunc, m_ctx);
+        m_llModelInfo.model->prompt(docsContext.toStdString(), "%1", promptFunc, responseFunc,
+                                    /*allowContextShift*/ true, m_ctx);
         m_ctx.n_predict = old_n_predict; // now we are ready for a response
     }
-    m_llModelInfo.model->prompt(prompt.toStdString(), promptTemplate.toStdString(), promptFunc, responseFunc, recalcFunc, m_ctx);
+    m_llModelInfo.model->prompt(prompt.toStdString(), promptTemplate.toStdString(), promptFunc, responseFunc,
+                                /*allowContextShift*/ true, m_ctx);
 #if defined(DEBUG)
     printf("\n");
     fflush(stdout);
@@ -755,7 +801,13 @@ bool ChatLLM::promptInternal(const QList<QString> &collectionList, const QString
         m_response = trimmed;
         emit responseChanged(QString::fromStdString(m_response));
     }
-    emit responseStopped(elapsed);
+
+    SuggestionMode mode = MySettings::globalInstance()->suggestionMode();
+    if (mode == SuggestionMode::On || (!databaseResults.isEmpty() && mode == SuggestionMode::LocalDocsOnly))
+        generateQuestions(elapsed);
+    else
+        emit responseStopped(elapsed);
+
     m_pristineLoadedState = false;
     return true;
 }
@@ -801,7 +853,7 @@ void ChatLLM::unloadModel()
 #endif
 
     if (m_forceUnloadModel) {
-        m_llModelInfo.model.reset();
+        m_llModelInfo.resetModel(this);
         m_forceUnloadModel = false;
     }
 
@@ -833,13 +885,18 @@ void ChatLLM::generateName()
     if (!isModelLoaded())
         return;
 
+    const QString chatNamePrompt = MySettings::globalInstance()->modelChatNamePrompt(m_modelInfo);
+    if (chatNamePrompt.trimmed().isEmpty()) {
+        qWarning() << "ChatLLM: not generating chat name because prompt is empty";
+        return;
+    }
+
     auto promptTemplate = MySettings::globalInstance()->modelPromptTemplate(m_modelInfo);
     auto promptFunc = std::bind(&ChatLLM::handleNamePrompt, this, std::placeholders::_1);
     auto responseFunc = std::bind(&ChatLLM::handleNameResponse, this, std::placeholders::_1, std::placeholders::_2);
-    auto recalcFunc = std::bind(&ChatLLM::handleNameRecalculate, this, std::placeholders::_1);
     LLModel::PromptContext ctx = m_ctx;
-    m_llModelInfo.model->prompt("Describe the above conversation in three words or less.",
-                                promptTemplate.toStdString(), promptFunc, responseFunc, recalcFunc, ctx);
+    m_llModelInfo.model->prompt(chatNamePrompt.toStdString(), promptTemplate.toStdString(),
+                                promptFunc, responseFunc, /*allowContextShift*/ false, ctx);
     std::string trimmed = trim_whitespace(m_nameResponse);
     if (trimmed != m_nameResponse) {
         m_nameResponse = trimmed;
@@ -859,7 +916,6 @@ bool ChatLLM::handleNamePrompt(int32_t token)
     qDebug() << "name prompt" << m_llmThread.objectName() << token;
 #endif
     Q_UNUSED(token);
-    qt_noop();
     return !m_stopGenerating;
 }
 
@@ -877,15 +933,72 @@ bool ChatLLM::handleNameResponse(int32_t token, const std::string &response)
     return words.size() <= 3;
 }
 
-bool ChatLLM::handleNameRecalculate(bool isRecalc)
+bool ChatLLM::handleQuestionPrompt(int32_t token)
 {
 #if defined(DEBUG)
-    qDebug() << "name recalc" << m_llmThread.objectName() << isRecalc;
+    qDebug() << "question prompt" << m_llmThread.objectName() << token;
 #endif
-    Q_UNUSED(isRecalc);
-    qt_noop();
+    Q_UNUSED(token);
+    return !m_stopGenerating;
+}
+
+bool ChatLLM::handleQuestionResponse(int32_t token, const std::string &response)
+{
+#if defined(DEBUG)
+    qDebug() << "question response" << m_llmThread.objectName() << token << response;
+#endif
+    Q_UNUSED(token);
+
+    // add token to buffer
+    m_questionResponse.append(response);
+
+    // match whole question sentences
+    // FIXME: This only works with response by the model in english which is not ideal for a multi-language
+    // model.
+    static const QRegularExpression reQuestion(R"(\b(What|Where|How|Why|When|Who|Which|Whose|Whom)\b[^?]*\?)");
+
+    // extract all questions from response
+    int lastMatchEnd = -1;
+    for (const auto &match : reQuestion.globalMatch(m_questionResponse)) {
+        lastMatchEnd = match.capturedEnd();
+        emit generatedQuestionFinished(match.captured());
+    }
+
+    // remove processed input from buffer
+    if (lastMatchEnd != -1)
+        m_questionResponse.erase(m_questionResponse.cbegin(), m_questionResponse.cbegin() + lastMatchEnd);
+
     return true;
 }
+
+void ChatLLM::generateQuestions(qint64 elapsed)
+{
+    Q_ASSERT(isModelLoaded());
+    if (!isModelLoaded()) {
+        emit responseStopped(elapsed);
+        return;
+    }
+
+    const std::string suggestedFollowUpPrompt = MySettings::globalInstance()->modelSuggestedFollowUpPrompt(m_modelInfo).toStdString();
+    if (QString::fromStdString(suggestedFollowUpPrompt).trimmed().isEmpty()) {
+        emit responseStopped(elapsed);
+        return;
+    }
+
+    emit generatingQuestions();
+    m_questionResponse.clear();
+    auto promptTemplate = MySettings::globalInstance()->modelPromptTemplate(m_modelInfo);
+    auto promptFunc = std::bind(&ChatLLM::handleQuestionPrompt, this, std::placeholders::_1);
+    auto responseFunc = std::bind(&ChatLLM::handleQuestionResponse, this, std::placeholders::_1, std::placeholders::_2);
+    LLModel::PromptContext ctx = m_ctx;
+    QElapsedTimer totalTime;
+    totalTime.start();
+    m_llModelInfo.model->prompt(suggestedFollowUpPrompt, promptTemplate.toStdString(), promptFunc, responseFunc,
+                                /*allowContextShift*/ false, ctx);
+    elapsed += totalTime.elapsed();
+    emit responseStopped(elapsed);
+}
+
 
 bool ChatLLM::handleSystemPrompt(int32_t token)
 {
@@ -896,15 +1009,6 @@ bool ChatLLM::handleSystemPrompt(int32_t token)
     return !m_stopGenerating;
 }
 
-bool ChatLLM::handleSystemRecalculate(bool isRecalc)
-{
-#if defined(DEBUG)
-    qDebug() << "system recalc" << m_llmThread.objectName() << isRecalc;
-#endif
-    Q_UNUSED(isRecalc);
-    return false;
-}
-
 bool ChatLLM::handleRestoreStateFromTextPrompt(int32_t token)
 {
 #if defined(DEBUG)
@@ -912,15 +1016,6 @@ bool ChatLLM::handleRestoreStateFromTextPrompt(int32_t token)
 #endif
     Q_UNUSED(token);
     return !m_stopGenerating;
-}
-
-bool ChatLLM::handleRestoreStateFromTextRecalculate(bool isRecalc)
-{
-#if defined(DEBUG)
-    qDebug() << "restore state from text recalc" << m_llmThread.objectName() << isRecalc;
-#endif
-    Q_UNUSED(isRecalc);
-    return false;
 }
 
 // this function serialized the cached model state to disk.
@@ -954,8 +1049,6 @@ bool ChatLLM::serialize(QDataStream &stream, int version, bool serializeKV)
     if (version >= 7) {
         stream << m_ctx.n_ctx;
     }
-    stream << quint64(m_ctx.logits.size());
-    stream.writeRawData(reinterpret_cast<const char*>(m_ctx.logits.data()), m_ctx.logits.size() * sizeof(float));
     stream << quint64(m_ctx.tokens.size());
     stream.writeRawData(reinterpret_cast<const char*>(m_ctx.tokens.data()), m_ctx.tokens.size() * sizeof(int));
     saveState();
@@ -1012,12 +1105,9 @@ bool ChatLLM::deserialize(QDataStream &stream, int version, bool deserializeKV, 
         if (!discardKV) m_ctx.n_ctx = n_ctx;
     }
 
-    quint64 logitsSize;
-    stream >> logitsSize;
-    if (!discardKV) {
-        m_ctx.logits.resize(logitsSize);
-        stream.readRawData(reinterpret_cast<char*>(m_ctx.logits.data()), logitsSize * sizeof(float));
-    } else {
+    if (version < 9) {
+        quint64 logitsSize;
+        stream >> logitsSize;
         stream.skipRawData(logitsSize * sizeof(float));
     }
 
@@ -1130,7 +1220,6 @@ void ChatLLM::processSystemPrompt()
     m_ctx = LLModel::PromptContext();
 
     auto promptFunc = std::bind(&ChatLLM::handleSystemPrompt, this, std::placeholders::_1);
-    auto recalcFunc = std::bind(&ChatLLM::handleSystemRecalculate, this, std::placeholders::_1);
 
     const int32_t n_predict = MySettings::globalInstance()->modelMaxLength(m_modelInfo);
     const int32_t top_k = MySettings::globalInstance()->modelTopK(m_modelInfo);
@@ -1156,7 +1245,7 @@ void ChatLLM::processSystemPrompt()
 #endif
     auto old_n_predict = std::exchange(m_ctx.n_predict, 0); // decode system prompt without a response
     // use "%1%2" and not "%1" to avoid implicit whitespace
-    m_llModelInfo.model->prompt(systemPrompt, "%1%2", promptFunc, nullptr, recalcFunc, m_ctx, true);
+    m_llModelInfo.model->prompt(systemPrompt, "%1%2", promptFunc, nullptr, /*allowContextShift*/ true, m_ctx, true);
     m_ctx.n_predict = old_n_predict;
 #if defined(DEBUG)
     printf("\n");
@@ -1173,14 +1262,13 @@ void ChatLLM::processRestoreStateFromText()
     if (!isModelLoaded() || !m_restoreStateFromText || m_isServer)
         return;
 
-    m_isRecalc = true;
-    emit recalcChanged();
+    m_restoringFromText = true;
+    emit restoringFromTextChanged();
 
     m_stopGenerating = false;
     m_ctx = LLModel::PromptContext();
 
     auto promptFunc = std::bind(&ChatLLM::handleRestoreStateFromTextPrompt, this, std::placeholders::_1);
-    auto recalcFunc = std::bind(&ChatLLM::handleRestoreStateFromTextRecalculate, this, std::placeholders::_1);
 
     const QString promptTemplate = MySettings::globalInstance()->modelPromptTemplate(m_modelInfo);
     const int32_t n_predict = MySettings::globalInstance()->modelMaxLength(m_modelInfo);
@@ -1213,7 +1301,7 @@ void ChatLLM::processRestoreStateFromText()
         auto responseText = response.second.toStdString();
 
         m_llModelInfo.model->prompt(prompt.second.toStdString(), promptTemplate.toStdString(), promptFunc, nullptr,
-                                    recalcFunc, m_ctx, false, &responseText);
+                                    /*allowContextShift*/ true, m_ctx, false, &responseText);
     }
 
     if (!m_stopGenerating) {
@@ -1221,8 +1309,8 @@ void ChatLLM::processRestoreStateFromText()
         m_stateFromText.clear();
     }
 
-    m_isRecalc = false;
-    emit recalcChanged();
+    m_restoringFromText = false;
+    emit restoringFromTextChanged();
 
     m_pristineLoadedState = false;
 }

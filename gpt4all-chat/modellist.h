@@ -12,14 +12,15 @@
 #include <QObject>
 #include <QPair>
 #include <QSortFilterProxyModel>
+#include <QSslError>
 #include <QString>
+#include <QVariant>
+#include <QVector>
 #include <Qt>
 #include <QtGlobal>
 #include <QtQml>
-#include <QVariant>
-#include <QVector>
 
-class QSslError;
+using namespace Qt::Literals::StringLiterals;
 
 struct ModelInfo {
     Q_GADGET
@@ -34,6 +35,7 @@ struct ModelInfo {
     Q_PROPERTY(bool installed MEMBER installed)
     Q_PROPERTY(bool isDefault MEMBER isDefault)
     Q_PROPERTY(bool isOnline MEMBER isOnline)
+    Q_PROPERTY(bool isCompatibleApi MEMBER isCompatibleApi)
     Q_PROPERTY(QString description READ description WRITE setDescription)
     Q_PROPERTY(QString requiresVersion MEMBER requiresVersion)
     Q_PROPERTY(QString versionRemoved MEMBER versionRemoved)
@@ -67,6 +69,8 @@ struct ModelInfo {
     Q_PROPERTY(int repeatPenaltyTokens READ repeatPenaltyTokens WRITE setRepeatPenaltyTokens)
     Q_PROPERTY(QString promptTemplate READ promptTemplate WRITE setPromptTemplate)
     Q_PROPERTY(QString systemPrompt READ systemPrompt WRITE setSystemPrompt)
+    Q_PROPERTY(QString chatNamePrompt READ chatNamePrompt WRITE setChatNamePrompt)
+    Q_PROPERTY(QString suggestedFollowUpPrompt READ suggestedFollowUpPrompt WRITE setSuggestedFollowUpPrompt)
     Q_PROPERTY(int likes READ likes WRITE setLikes)
     Q_PROPERTY(int downloads READ downloads WRITE setDownloads)
     Q_PROPERTY(QDateTime recency READ recency WRITE setRecency)
@@ -120,7 +124,17 @@ public:
     bool calcHash = false;
     bool installed = false;
     bool isDefault = false;
+    // Differences between 'isOnline' and 'isCompatibleApi' in ModelInfo:
+    // 'isOnline':
+    // - Indicates whether this is a online model.
+    // - Linked with the ModelList, fetching info from it.
     bool isOnline = false;
+    // 'isCompatibleApi':
+    // - Indicates whether the model is using the OpenAI-compatible API which user custom.
+    // - When the property is true, 'isOnline' should also be true.
+    // - Does not link to the ModelList directly; instead, fetches info from the *-capi.rmodel file and works standalone.
+    // - Still needs to copy data from gpt4all.ini and *-capi.rmodel to the ModelList in memory while application getting started(as custom .gguf models do).
+    bool isCompatibleApi = false;
     QString requiresVersion;
     QString versionRemoved;
     qint64 bytesReceived = 0;
@@ -166,10 +180,16 @@ public:
     void setPromptTemplate(const QString &t);
     QString systemPrompt() const;
     void setSystemPrompt(const QString &p);
+    QString chatNamePrompt() const;
+    void setChatNamePrompt(const QString &p);
+    QString suggestedFollowUpPrompt() const;
+    void setSuggestedFollowUpPrompt(const QString &p);
 
     bool shouldSaveMetadata() const;
 
 private:
+    QVariantMap getFields() const;
+
     QString m_id;
     QString m_name;
     QString m_filename;
@@ -177,57 +197,37 @@ private:
     QString m_url;
     QString m_quant;
     QString m_type;
-    bool    m_isClone              = false;
-    bool    m_isDiscovered         = false;
-    int     m_likes                = -1;
-    int     m_downloads            = -1;
+    bool    m_isClone                 = false;
+    bool    m_isDiscovered            = false;
+    int     m_likes                   = -1;
+    int     m_downloads               = -1;
     QDateTime m_recency;
-    double  m_temperature          = 0.7;
-    double  m_topP                 = 0.4;
-    double  m_minP                 = 0.0;
-    int     m_topK                 = 40;
-    int     m_maxLength            = 4096;
-    int     m_promptBatchSize      = 128;
-    int     m_contextLength        = 2048;
-    mutable int m_maxContextLength = -1;
-    int     m_gpuLayers            = 100;
-    mutable int m_maxGpuLayers     = -1;
-    double  m_repeatPenalty        = 1.18;
-    int     m_repeatPenaltyTokens  = 64;
-    QString m_promptTemplate       = "### Human:\n%1\n\n### Assistant:\n";
-    QString m_systemPrompt         = "### System:\nYou are an AI assistant who gives a quality response to whatever humans ask of you.\n\n";
+    double  m_temperature             = 0.7;
+    double  m_topP                    = 0.4;
+    double  m_minP                    = 0.0;
+    int     m_topK                    = 40;
+    int     m_maxLength               = 4096;
+    int     m_promptBatchSize         = 128;
+    int     m_contextLength           = 2048;
+    mutable int m_maxContextLength    = -1;
+    int     m_gpuLayers               = 100;
+    mutable int m_maxGpuLayers        = -1;
+    double  m_repeatPenalty           = 1.18;
+    int     m_repeatPenaltyTokens     = 64;
+    QString m_promptTemplate          = "### Human:\n%1\n\n### Assistant:\n";
+    QString m_systemPrompt            = "### System:\nYou are an AI assistant who gives a quality response to whatever humans ask of you.\n\n";
+    QString m_chatNamePrompt          = "Describe the above conversation in seven words or less.";
+    QString m_suggestedFollowUpPrompt = "Suggest three very short factual follow-up questions that have not been answered yet or cannot be found inspired by the previous conversation and excerpts.";
     friend class MySettings;
 };
 Q_DECLARE_METATYPE(ModelInfo)
-
-class EmbeddingModels : public QSortFilterProxyModel
-{
-    Q_OBJECT
-    Q_PROPERTY(int count READ count NOTIFY countChanged)
-public:
-    EmbeddingModels(QObject *parent, bool requireInstalled);
-    int count() const { return rowCount(); }
-
-    int defaultModelIndex() const;
-    ModelInfo defaultModelInfo() const;
-
-Q_SIGNALS:
-    void countChanged();
-    void defaultModelIndexChanged();
-
-protected:
-    bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
-
-private:
-    bool m_requireInstalled;
-};
 
 class InstalledModels : public QSortFilterProxyModel
 {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)
 public:
-    explicit InstalledModels(QObject *parent);
+    explicit InstalledModels(QObject *parent, bool selectable = false);
     int count() const { return rowCount(); }
 
 Q_SIGNALS:
@@ -235,6 +235,9 @@ Q_SIGNALS:
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
+
+private:
+    bool m_selectable;
 };
 
 class DownloadableModels : public QSortFilterProxyModel
@@ -270,11 +273,10 @@ class ModelList : public QAbstractListModel
 {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)
-    Q_PROPERTY(int defaultEmbeddingModelIndex READ defaultEmbeddingModelIndex)
-    Q_PROPERTY(EmbeddingModels* installedEmbeddingModels READ installedEmbeddingModels NOTIFY installedEmbeddingModelsChanged)
     Q_PROPERTY(InstalledModels* installedModels READ installedModels NOTIFY installedModelsChanged)
+    Q_PROPERTY(InstalledModels* selectableModels READ selectableModels NOTIFY selectableModelsChanged)
     Q_PROPERTY(DownloadableModels* downloadableModels READ downloadableModels NOTIFY downloadableModelsChanged)
-    Q_PROPERTY(QList<QString> userDefaultModelList READ userDefaultModelList NOTIFY userDefaultModelListChanged)
+    Q_PROPERTY(QList<ModelInfo> selectableModelList READ selectableModelList NOTIFY  selectableModelListChanged)
     Q_PROPERTY(bool asyncModelRequestOngoing READ asyncModelRequestOngoing NOTIFY asyncModelRequestOngoingChanged)
     Q_PROPERTY(int discoverLimit READ discoverLimit WRITE setDiscoverLimit NOTIFY discoverLimitChanged)
     Q_PROPERTY(int discoverSortDirection READ discoverSortDirection WRITE setDiscoverSortDirection NOTIFY discoverSortDirectionChanged)
@@ -284,6 +286,9 @@ class ModelList : public QAbstractListModel
 
 public:
     static ModelList *globalInstance();
+
+    static QString compatibleModelNameHash(QUrl baseUrl, QString modelName);
+    static QString compatibleModelFilename(QUrl baseUrl, QString modelName);
 
     enum DiscoverSort {
         Default,
@@ -304,6 +309,7 @@ public:
         InstalledRole,
         DefaultRole,
         OnlineRole,
+        CompatibleApiRole,
         DescriptionRole,
         RequiresVersionRole,
         VersionRemovedRole,
@@ -334,6 +340,8 @@ public:
         RepeatPenaltyTokensRole,
         PromptTemplateRole,
         SystemPromptRole,
+        ChatNamePromptRole,
+        SuggestedFollowUpPromptRole,
         MinPRole,
         LikesRole,
         DownloadsRole,
@@ -354,6 +362,7 @@ public:
         roles[InstalledRole] = "installed";
         roles[DefaultRole] = "isDefault";
         roles[OnlineRole] = "isOnline";
+        roles[CompatibleApiRole] = "isCompatibleApi";
         roles[DescriptionRole] = "description";
         roles[RequiresVersionRole] = "requiresVersion";
         roles[VersionRemovedRole] = "versionRemoved";
@@ -385,6 +394,8 @@ public:
         roles[RepeatPenaltyTokensRole] = "repeatPenaltyTokens";
         roles[PromptTemplateRole] = "promptTemplate";
         roles[SystemPromptRole] = "systemPrompt";
+        roles[ChatNamePromptRole] = "chatNamePrompt";
+        roles[SuggestedFollowUpPromptRole] = "suggestedFollowUpPrompt";
         roles[LikesRole] = "likes";
         roles[DownloadsRole] = "downloads";
         roles[RecencyRole] = "recency";
@@ -409,28 +420,25 @@ public:
     Q_INVOKABLE void removeClone(const ModelInfo &model);
     Q_INVOKABLE void removeInstalled(const ModelInfo &model);
     ModelInfo defaultModelInfo() const;
-    int defaultEmbeddingModelIndex() const;
 
     void addModel(const QString &id);
     void changeId(const QString &oldId, const QString &newId);
 
-    const QList<ModelInfo> exportModelList() const;
-    const QList<QString> userDefaultModelList() const;
+    const QList<ModelInfo> selectableModelList() const;
 
-    EmbeddingModels *embeddingModels() const { return m_embeddingModels; }
-    EmbeddingModels *installedEmbeddingModels() const { return m_installedEmbeddingModels; }
     InstalledModels *installedModels() const { return m_installedModels; }
+    InstalledModels *selectableModels() const { return m_selectableModels; }
     DownloadableModels *downloadableModels() const { return m_downloadableModels; }
 
     static inline QString toFileSize(quint64 sz) {
         if (sz < 1024) {
-            return QString("%1 bytes").arg(sz);
+            return u"%1 bytes"_s.arg(sz);
         } else if (sz < 1024 * 1024) {
-            return QString("%1 KB").arg(qreal(sz) / 1024, 0, 'g', 3);
+            return u"%1 KB"_s.arg(qreal(sz) / 1024, 0, 'g', 3);
         } else if (sz < 1024 * 1024 * 1024) {
-            return  QString("%1 MB").arg(qreal(sz) / (1024 * 1024), 0, 'g', 3);
+            return u"%1 MB"_s.arg(qreal(sz) / (1024 * 1024), 0, 'g', 3);
         } else {
-            return QString("%1 GB").arg(qreal(sz) / (1024 * 1024 * 1024), 0, 'g', 3);
+            return u"%1 GB"_s.arg(qreal(sz) / (1024 * 1024 * 1024), 0, 'g', 3);
         }
     }
 
@@ -456,16 +464,19 @@ public:
 
 Q_SIGNALS:
     void countChanged();
-    void installedEmbeddingModelsChanged();
     void installedModelsChanged();
+    void selectableModelsChanged();
     void downloadableModelsChanged();
-    void userDefaultModelListChanged();
+    void selectableModelListChanged();
     void asyncModelRequestOngoingChanged();
     void discoverLimitChanged();
     void discoverSortDirectionChanged();
     void discoverSortChanged();
     void discoverProgressChanged();
     void discoverInProgressChanged();
+
+protected:
+    bool eventFilter(QObject *obj, QEvent *ev) override;
 
 private Q_SLOTS:
     void resortModel();
@@ -495,9 +506,8 @@ private:
 private:
     mutable QMutex m_mutex;
     QNetworkAccessManager m_networkManager;
-    EmbeddingModels *m_embeddingModels;
-    EmbeddingModels *m_installedEmbeddingModels;
     InstalledModels *m_installedModels;
+    InstalledModels *m_selectableModels;
     DownloadableModels *m_downloadableModels;
     QList<ModelInfo*> m_models;
     QHash<QString, ModelInfo*> m_modelMap;

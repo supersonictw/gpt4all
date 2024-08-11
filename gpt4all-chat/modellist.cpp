@@ -1,5 +1,6 @@
 #include "modellist.h"
 
+#include "download.h"
 #include "mysettings.h"
 #include "network.h"
 
@@ -25,26 +26,24 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSslConfiguration>
-#include <QSslError>
 #include <QSslSocket>
+#include <QStringList>
 #include <QTextStream>
 #include <QTimer>
-#include <QtLogging>
 #include <QUrl>
+#include <QtLogging>
 
 #include <algorithm>
-#include <compare>
 #include <cstddef>
 #include <iterator>
 #include <string>
 #include <utility>
 
+using namespace Qt::Literals::StringLiterals;
+
 //#define USE_LOCAL_MODELSJSON
 
-const char * const KNOWN_EMBEDDING_MODELS[] {
-    "all-MiniLM-L6-v2.gguf2.f16.gguf",
-    "gpt4all-nomic-embed-text-v1.rmodel",
-};
+static const QStringList FILENAME_BLACKLIST { u"gpt4all-nomic-embed-text-v1.rmodel"_s };
 
 QString ModelInfo::id() const
 {
@@ -335,65 +334,66 @@ void ModelInfo::setSystemPrompt(const QString &p)
     m_systemPrompt = p;
 }
 
+QString ModelInfo::chatNamePrompt() const
+{
+    return MySettings::globalInstance()->modelChatNamePrompt(*this);
+}
+
+void ModelInfo::setChatNamePrompt(const QString &p)
+{
+    if (shouldSaveMetadata()) MySettings::globalInstance()->setModelChatNamePrompt(*this, p, true /*force*/);
+    m_chatNamePrompt = p;
+}
+
+QString ModelInfo::suggestedFollowUpPrompt() const
+{
+    return MySettings::globalInstance()->modelSuggestedFollowUpPrompt(*this);
+}
+
+void ModelInfo::setSuggestedFollowUpPrompt(const QString &p)
+{
+    if (shouldSaveMetadata()) MySettings::globalInstance()->setModelSuggestedFollowUpPrompt(*this, p, true /*force*/);
+    m_suggestedFollowUpPrompt = p;
+}
+
 bool ModelInfo::shouldSaveMetadata() const
 {
     return installed && (isClone() || isDiscovered() || description() == "" /*indicates sideloaded*/);
 }
 
-EmbeddingModels::EmbeddingModels(QObject *parent, bool requireInstalled)
+QVariantMap ModelInfo::getFields() const
+{
+    return {
+        { "filename",            m_filename },
+        { "description",         m_description },
+        { "url",                 m_url },
+        { "quant",               m_quant },
+        { "type",                m_type },
+        { "isClone",             m_isClone },
+        { "isDiscovered",        m_isDiscovered },
+        { "likes",               m_likes },
+        { "downloads",           m_downloads },
+        { "recency",             m_recency },
+        { "temperature",         m_temperature },
+        { "topP",                m_topP },
+        { "minP",                m_minP },
+        { "topK",                m_topK },
+        { "maxLength",           m_maxLength },
+        { "promptBatchSize",     m_promptBatchSize },
+        { "contextLength",       m_contextLength },
+        { "gpuLayers",           m_gpuLayers },
+        { "repeatPenalty",       m_repeatPenalty },
+        { "repeatPenaltyTokens", m_repeatPenaltyTokens },
+        { "promptTemplate",      m_promptTemplate },
+        { "systemPrompt",        m_systemPrompt },
+        { "chatNamePrompt",      m_chatNamePrompt },
+        { "suggestedFollowUpPrompt", m_suggestedFollowUpPrompt },
+    };
+}
+
+InstalledModels::InstalledModels(QObject *parent, bool selectable)
     : QSortFilterProxyModel(parent)
-{
-    m_requireInstalled = requireInstalled;
-
-    connect(this, &EmbeddingModels::rowsInserted, this, &EmbeddingModels::countChanged);
-    connect(this, &EmbeddingModels::rowsRemoved, this, &EmbeddingModels::countChanged);
-    connect(this, &EmbeddingModels::modelReset, this, &EmbeddingModels::countChanged);
-    connect(this, &EmbeddingModels::layoutChanged, this, &EmbeddingModels::countChanged);
-}
-
-bool EmbeddingModels::filterAcceptsRow(int sourceRow,
-                                       const QModelIndex &sourceParent) const
-{
-    QModelIndex index = sourceModel()->index(sourceRow, 0, sourceParent);
-    bool isEmbeddingModel = sourceModel()->data(index, ModelList::IsEmbeddingModelRole).toBool();
-    bool installed = sourceModel()->data(index, ModelList::InstalledRole).toBool();
-    QString filename = sourceModel()->data(index, ModelList::FilenameRole).toString();
-    auto &known = KNOWN_EMBEDDING_MODELS;
-    if (std::find(known, std::end(known), filename.toStdString()) == std::end(known))
-        return false; // we are currently not prepared to support other embedding models
-
-    return isEmbeddingModel && (!m_requireInstalled || installed);
-}
-
-int EmbeddingModels::defaultModelIndex() const
-{
-    auto *sourceListModel = qobject_cast<const ModelList*>(sourceModel());
-    if (!sourceListModel) return -1;
-
-    int rows = sourceListModel->rowCount();
-    for (int i = 0; i < rows; ++i) {
-        if (filterAcceptsRow(i, sourceListModel->index(i, 0).parent()))
-            return i;
-    }
-
-    return -1;
-}
-
-ModelInfo EmbeddingModels::defaultModelInfo() const
-{
-    auto *sourceListModel = qobject_cast<const ModelList*>(sourceModel());
-    if (!sourceListModel) return ModelInfo();
-
-    int i = defaultModelIndex();
-    if (i < 0) return ModelInfo();
-
-    QModelIndex sourceIndex = sourceListModel->index(i, 0);
-    auto id = sourceListModel->data(sourceIndex, ModelList::IdRole).toString();
-    return sourceListModel->modelInfo(id);
-}
-
-InstalledModels::InstalledModels(QObject *parent)
-    : QSortFilterProxyModel(parent)
+    , m_selectable(selectable)
 {
     connect(this, &InstalledModels::rowsInserted, this, &InstalledModels::countChanged);
     connect(this, &InstalledModels::rowsRemoved, this, &InstalledModels::countChanged);
@@ -404,11 +404,15 @@ InstalledModels::InstalledModels(QObject *parent)
 bool InstalledModels::filterAcceptsRow(int sourceRow,
                                        const QModelIndex &sourceParent) const
 {
+    /* TODO(jared): We should list incomplete models alongside installed models on the
+     * Models page. Simply replacing isDownloading with isIncomplete here doesn't work for
+     * some reason - the models show up as something else. */
     QModelIndex index = sourceModel()->index(sourceRow, 0, sourceParent);
     bool isInstalled = sourceModel()->data(index, ModelList::InstalledRole).toBool();
+    bool isDownloading = sourceModel()->data(index, ModelList::DownloadingRole).toBool();
     bool isEmbeddingModel = sourceModel()->data(index, ModelList::IsEmbeddingModelRole).toBool();
     // list installed chat models
-    return isInstalled && !isEmbeddingModel;
+    return (isInstalled || (!m_selectable && isDownloading)) && !isEmbeddingModel;
 }
 
 DownloadableModels::DownloadableModels(QObject *parent)
@@ -425,13 +429,12 @@ DownloadableModels::DownloadableModels(QObject *parent)
 bool DownloadableModels::filterAcceptsRow(int sourceRow,
                                           const QModelIndex &sourceParent) const
 {
+    // FIXME We can eliminate the 'expanded' code as the UI no longer uses this
     bool withinLimit = sourceRow < (m_expanded ? sourceModel()->rowCount() : m_limit);
     QModelIndex index = sourceModel()->index(sourceRow, 0, sourceParent);
-    bool isDownloadable = !sourceModel()->data(index, ModelList::DescriptionRole).toString().isEmpty();
-    bool isInstalled = !sourceModel()->data(index, ModelList::InstalledRole).toString().isEmpty();
-    bool isIncomplete = !sourceModel()->data(index, ModelList::IncompleteRole).toString().isEmpty();
+    bool hasDescription = !sourceModel()->data(index, ModelList::DescriptionRole).toString().isEmpty();
     bool isClone = sourceModel()->data(index, ModelList::IsCloneRole).toBool();
-    return withinLimit && !isClone && (isDownloadable || isInstalled || isIncomplete);
+    return withinLimit && hasDescription && !isClone;
 }
 
 int DownloadableModels::count() const
@@ -469,9 +472,8 @@ ModelList *ModelList::globalInstance()
 
 ModelList::ModelList()
     : QAbstractListModel(nullptr)
-    , m_embeddingModels(new EmbeddingModels(this, false /* all models */))
     , m_installedModels(new InstalledModels(this))
-    , m_installedEmbeddingModels(new EmbeddingModels(this, true /* installed models */))
+    , m_selectableModels(new InstalledModels(this, /*selectable*/ true))
     , m_downloadableModels(new DownloadableModels(this))
     , m_asyncModelRequestOngoing(false)
     , m_discoverLimit(20)
@@ -481,9 +483,10 @@ ModelList::ModelList()
     , m_discoverResultsCompleted(0)
     , m_discoverInProgress(false)
 {
-    m_embeddingModels->setSourceModel(this);
+    QCoreApplication::instance()->installEventFilter(this);
+
     m_installedModels->setSourceModel(this);
-    m_installedEmbeddingModels->setSourceModel(this);
+    m_selectableModels->setSourceModel(this);
     m_downloadableModels->setSourceModel(this);
 
     connect(MySettings::globalInstance(), &MySettings::modelPathChanged, this, &ModelList::updateModelsFromDirectory);
@@ -507,6 +510,26 @@ ModelList::ModelList()
     updateModelsFromJson();
     updateModelsFromSettings();
     updateModelsFromDirectory();
+
+    QCoreApplication::instance()->installEventFilter(this);
+}
+
+QString ModelList::compatibleModelNameHash(QUrl baseUrl, QString modelName) {
+    QCryptographicHash sha256(QCryptographicHash::Sha256);
+    sha256.addData((baseUrl.toString() + "_" + modelName).toUtf8());
+    return sha256.result().toHex();
+};
+
+QString ModelList::compatibleModelFilename(QUrl baseUrl, QString modelName) {
+    QString hash(compatibleModelNameHash(baseUrl, modelName));
+    return QString(u"gpt4all-%1-capi.rmodel"_s).arg(hash);
+};
+
+bool ModelList::eventFilter(QObject *obj, QEvent *ev)
+{
+    if (obj == QCoreApplication::instance() && ev->type() == QEvent::LanguageChange)
+        emit dataChanged(index(0, 0), index(m_models.size() - 1, 0));
+    return false;
 }
 
 QString ModelList::incompleteDownloadPath(const QString &modelFile)
@@ -514,48 +537,15 @@ QString ModelList::incompleteDownloadPath(const QString &modelFile)
     return MySettings::globalInstance()->modelPath() + "incomplete-" + modelFile;
 }
 
-const QList<ModelInfo> ModelList::exportModelList() const
+const QList<ModelInfo> ModelList::selectableModelList() const
 {
+    // FIXME: This needs to be kept in sync with m_selectableModels so should probably be merged
     QMutexLocker locker(&m_mutex);
     QList<ModelInfo> infos;
     for (ModelInfo *info : m_models)
-        if (info->installed)
+        if (info->installed && !info->isEmbeddingModel)
             infos.append(*info);
     return infos;
-}
-
-const QList<QString> ModelList::userDefaultModelList() const
-{
-    QMutexLocker locker(&m_mutex);
-
-    const QString userDefaultModelName = MySettings::globalInstance()->userDefaultModel();
-    QList<QString> models;
-    bool foundUserDefault = false;
-    for (ModelInfo *info : m_models) {
-
-        // Only installed chat models are suitable as a default
-        if (!info->installed || info->isEmbeddingModel)
-            continue;
-
-        if (info->id() == userDefaultModelName) {
-            foundUserDefault = true;
-            models.prepend(info->name());
-        } else {
-            models.append(info->name());
-        }
-    }
-
-    const QString defaultId = "Application default";
-    if (foundUserDefault)
-        models.append(defaultId);
-    else
-        models.prepend(defaultId);
-    return models;
-}
-
-int ModelList::defaultEmbeddingModelIndex() const
-{
-    return embeddingModels()->defaultModelIndex();
 }
 
 ModelInfo ModelList::defaultModelInfo() const
@@ -563,7 +553,6 @@ ModelInfo ModelList::defaultModelInfo() const
     QMutexLocker locker(&m_mutex);
 
     QSettings settings;
-    settings.sync();
 
     // The user default model can be set by the user in the settings dialog. The "default" user
     // default model is "Application default" which signals we should use the logic here.
@@ -675,7 +664,7 @@ void ModelList::addModel(const QString &id)
     m_mutex.unlock();
     endInsertRows();
 
-    emit userDefaultModelListChanged();
+    emit selectableModelListChanged();
 }
 
 void ModelList::changeId(const QString &oldId, const QString &newId)
@@ -725,6 +714,8 @@ QVariant ModelList::dataInternal(const ModelInfo *info, int role) const
             return info->isDefault;
         case OnlineRole:
             return info->isOnline;
+        case CompatibleApiRole:
+            return info->isCompatibleApi;
         case DescriptionRole:
             return info->description();
         case RequiresVersionRole:
@@ -787,6 +778,10 @@ QVariant ModelList::dataInternal(const ModelInfo *info, int role) const
             return info->promptTemplate();
         case SystemPromptRole:
             return info->systemPrompt();
+        case ChatNamePromptRole:
+            return info->chatNamePrompt();
+        case SuggestedFollowUpPromptRole:
+            return info->suggestedFollowUpPrompt();
         case LikesRole:
             return info->likes();
         case DownloadsRole:
@@ -877,6 +872,8 @@ void ModelList::updateData(const QString &id, const QVector<QPair<int, QVariant>
                 info->isDefault = value.toBool(); break;
             case OnlineRole:
                 info->isOnline = value.toBool(); break;
+            case CompatibleApiRole:
+                info->isCompatibleApi = value.toBool(); break;
             case DescriptionRole:
                 info->setDescription(value.toString()); break;
             case RequiresVersionRole:
@@ -957,6 +954,10 @@ void ModelList::updateData(const QString &id, const QVector<QPair<int, QVariant>
                 info->setPromptTemplate(value.toString()); break;
             case SystemPromptRole:
                 info->setSystemPrompt(value.toString()); break;
+            case ChatNamePromptRole:
+                info->setChatNamePrompt(value.toString()); break;
+            case SuggestedFollowUpPromptRole:
+                info->setSuggestedFollowUpPrompt(value.toString()); break;
             case LikesRole:
                 {
                     if (info->likes() != value.toInt()) {
@@ -1009,7 +1010,13 @@ void ModelList::updateData(const QString &id, const QVector<QPair<int, QVariant>
         }
     }
     emit dataChanged(createIndex(index, 0), createIndex(index, 0));
-    emit userDefaultModelListChanged();
+
+    // FIXME(jared): for some reason these don't update correctly when the source model changes, so we explicitly invalidate them
+    m_selectableModels->invalidate();
+    m_installedModels->invalidate();
+    m_downloadableModels->invalidate();
+
+    emit selectableModelListChanged();
 }
 
 void ModelList::resortModel()
@@ -1087,6 +1094,7 @@ QString ModelList::clone(const ModelInfo &model)
         { ModelList::FilenameRole, model.filename() },
         { ModelList::DirpathRole, model.dirpath },
         { ModelList::OnlineRole, model.isOnline },
+        { ModelList::CompatibleApiRole, model.isCompatibleApi },
         { ModelList::IsEmbeddingModelRole, model.isEmbeddingModel },
         { ModelList::TemperatureRole, model.temperature() },
         { ModelList::TopPRole, model.topP() },
@@ -1100,6 +1108,8 @@ QString ModelList::clone(const ModelInfo &model)
         { ModelList::RepeatPenaltyTokensRole, model.repeatPenaltyTokens() },
         { ModelList::PromptTemplateRole, model.promptTemplate() },
         { ModelList::SystemPromptRole, model.systemPrompt() },
+        { ModelList::ChatNamePromptRole, model.chatNamePrompt() },
+        { ModelList::SuggestedFollowUpPromptRole, model.suggestedFollowUpPrompt() },
     };
     updateData(id, data);
     return id;
@@ -1119,7 +1129,7 @@ void ModelList::removeInstalled(const ModelInfo &model)
 {
     Q_ASSERT(model.installed);
     Q_ASSERT(!model.isClone());
-    Q_ASSERT(model.isDiscovered() || model.description() == "" /*indicates sideloaded*/);
+    Q_ASSERT(model.isDiscovered() || model.isCompatibleApi || model.description() == "" /*indicates sideloaded*/);
     removeInternal(model);
     emit layoutChanged();
 }
@@ -1147,14 +1157,14 @@ void ModelList::removeInternal(const ModelInfo &model)
         delete info;
     }
     endRemoveRows();
-    emit userDefaultModelListChanged();
+    emit selectableModelListChanged();
     MySettings::globalInstance()->eraseModel(model);
 }
 
 QString ModelList::uniqueModelName(const ModelInfo &model) const
 {
     QMutexLocker locker(&m_mutex);
-    QRegularExpression re("^(.*)~(\\d+)$");
+    static const QRegularExpression re("^(.*)~(\\d+)$");
     QRegularExpressionMatch match = re.match(model.name());
     QString baseName;
     if (match.hasMatch())
@@ -1209,13 +1219,11 @@ void ModelList::updateModelsFromDirectory()
             it.next();
             if (!it.fileInfo().isDir()) {
                 QString filename = it.fileName();
-                if (filename.endsWith(".txt") && (filename.startsWith("chatgpt-") || filename.startsWith("nomic-"))) {
+                if (filename.startsWith("chatgpt-") && filename.endsWith(".txt")) {
                     QString apikey;
                     QString modelname(filename);
                     modelname.chop(4); // strip ".txt" extension
-                    if (filename.startsWith("chatgpt-")) {
-                        modelname.remove(0, 8); // strip "chatgpt-" prefix
-                    }
+                    modelname.remove(0, 8); // strip "chatgpt-" prefix
                     QFile file(path + filename);
                     if (file.open(QIODevice::ReadWrite)) {
                         QTextStream in(&file);
@@ -1228,7 +1236,7 @@ void ModelList::updateModelsFromDirectory()
                     obj.insert("modelName", modelname);
                     QJsonDocument doc(obj);
 
-                    auto newfilename = QString("gpt4all-%1.rmodel").arg(modelname);
+                    auto newfilename = u"gpt4all-%1.rmodel"_s.arg(modelname);
                     QFile newfile(path + newfilename);
                     if (newfile.open(QIODevice::ReadWrite)) {
                         QTextStream out(&newfile);
@@ -1242,46 +1250,80 @@ void ModelList::updateModelsFromDirectory()
     };
 
     auto processDirectory = [&](const QString& path) {
-        QDirIterator it(path, QDirIterator::Subdirectories);
+        QDirIterator it(path, QDir::Files, QDirIterator::Subdirectories);
         while (it.hasNext()) {
             it.next();
 
-            if (!it.fileInfo().isDir()) {
-                QString filename = it.fileName();
+            QString filename = it.fileName();
+            if (filename.startsWith("incomplete") || FILENAME_BLACKLIST.contains(filename))
+                continue;
+            if (!filename.endsWith(".gguf") && !filename.endsWith(".rmodel"))
+                continue;
 
-                if ((filename.endsWith(".gguf") && !filename.startsWith("incomplete")) || filename.endsWith(".rmodel")) {
+            QVector<QString> modelsById;
+            {
+                QMutexLocker locker(&m_mutex);
+                for (ModelInfo *info : m_models)
+                    if (info->filename() == filename)
+                        modelsById.append(info->id());
+            }
 
-                    QString filePath = it.filePath();
-                    QFileInfo info(filePath);
+            if (modelsById.isEmpty()) {
+                if (!contains(filename))
+                    addModel(filename);
+                modelsById.append(filename);
+            }
 
-                    if (!info.exists())
-                        continue;
+            QFileInfo info = it.fileInfo();
 
-                    QVector<QString> modelsById;
-                    {
-                        QMutexLocker locker(&m_mutex);
-                        for (ModelInfo *info : m_models)
-                            if (info->filename() == filename)
-                                modelsById.append(info->id());
-                    }
+            bool isOnline(filename.endsWith(".rmodel"));
+            bool isCompatibleApi(filename.endsWith("-capi.rmodel"));
 
-                    if (modelsById.isEmpty()) {
-                        if (!contains(filename))
-                            addModel(filename);
-                        modelsById.append(filename);
-                    }
-
-                    for (const QString &id : modelsById) {
-                        QVector<QPair<int, QVariant>> data {
-                            { InstalledRole, true },
-                            { FilenameRole, filename },
-                            { OnlineRole, filename.endsWith(".rmodel") },
-                            { DirpathRole, info.dir().absolutePath() + "/" },
-                            { FilesizeRole, toFileSize(info.size()) },
-                        };
-                        updateData(id, data);
-                    }
+            QString name;
+            QString description;
+            if (isCompatibleApi) {
+                QJsonObject obj;
+                {
+                    QFile file(path + filename);
+                    bool success = file.open(QIODeviceBase::ReadOnly);
+                    (void)success;
+                    Q_ASSERT(success);
+                    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+                    obj = doc.object();
                 }
+                {
+                    QString apiKey(obj["apiKey"].toString());
+                    QString baseUrl(obj["baseUrl"].toString());
+                    QString modelName(obj["modelName"].toString());
+                    apiKey = apiKey.length() < 10 ? "*****" : apiKey.left(5) + "*****";
+                    name = tr("%1 (%2)").arg(modelName, baseUrl);
+                    description = tr("<strong>OpenAI-Compatible API Model</strong><br>"
+                                     "<ul><li>API Key: %1</li>"
+                                     "<li>Base URL: %2</li>"
+                                     "<li>Model Name: %3</li></ul>")
+                                        .arg(apiKey, baseUrl, modelName);
+                }
+            }
+
+            for (const QString &id : modelsById) {
+                QVector<QPair<int, QVariant>> data {
+                    { InstalledRole, true },
+                    { FilenameRole, filename },
+                    { OnlineRole, isOnline },
+                    { CompatibleApiRole, isCompatibleApi },
+                    { DirpathRole, info.dir().absolutePath() + "/" },
+                    { FilesizeRole, toFileSize(info.size()) },
+                };
+                if (isCompatibleApi) {
+                    // The data will be saved to "GPT4All.ini".
+                    data.append({ NameRole, name });
+                    // The description is hard-coded into "GPT4All.ini" due to performance issue.
+                    // If the description goes to be dynamic from its .rmodel file, it will get high I/O usage while using the ModelList.
+                    data.append({ DescriptionRole, description });
+                    // Prompt template should be clear while using ChatML format which is using in most of OpenAI-Compatible API server.
+                    data.append({ PromptTemplateRole, "%1" });
+                }
+                updateData(id, data);
             }
         }
     };
@@ -1300,9 +1342,9 @@ void ModelList::updateModelsFromDirectory()
 void ModelList::updateModelsFromJson()
 {
 #if defined(USE_LOCAL_MODELSJSON)
-    QUrl jsonUrl("file://" + QDir::homePath() + QString("/dev/large_language_models/gpt4all/gpt4all-chat/metadata/models%1.json").arg(MODELS_VERSION));
+    QUrl jsonUrl("file://" + QDir::homePath() + u"/dev/large_language_models/gpt4all/gpt4all-chat/metadata/models%1.json"_s.arg(MODELS_VERSION));
 #else
-    QUrl jsonUrl(QString("http://gpt4all.io/models/models%1.json").arg(MODELS_VERSION));
+    QUrl jsonUrl(u"http://gpt4all.io/models/models%1.json"_s.arg(MODELS_VERSION));
 #endif
     QNetworkRequest request(jsonUrl);
     QSslConfiguration conf = request.sslConfiguration();
@@ -1344,9 +1386,9 @@ void ModelList::updateModelsFromJsonAsync()
     emit asyncModelRequestOngoingChanged();
 
 #if defined(USE_LOCAL_MODELSJSON)
-    QUrl jsonUrl("file://" + QDir::homePath() + QString("/dev/large_language_models/gpt4all/gpt4all-chat/metadata/models%1.json").arg(MODELS_VERSION));
+    QUrl jsonUrl("file://" + QDir::homePath() + u"/dev/large_language_models/gpt4all/gpt4all-chat/metadata/models%1.json"_s.arg(MODELS_VERSION));
 #else
-    QUrl jsonUrl(QString("http://gpt4all.io/models/models%1.json").arg(MODELS_VERSION));
+    QUrl jsonUrl(u"http://gpt4all.io/models/models%1.json"_s.arg(MODELS_VERSION));
 #endif
     QNetworkRequest request(jsonUrl);
     QSslConfiguration conf = request.sslConfiguration();
@@ -1384,7 +1426,7 @@ void ModelList::handleModelsJsonDownloadErrorOccurred(QNetworkReply::NetworkErro
     if (!reply)
         return;
 
-    qWarning() << QString("ERROR: Modellist download failed with error code \"%1-%2\"")
+    qWarning() << u"ERROR: Modellist download failed with error code \"%1-%2\""_s
                       .arg(code).arg(reply->errorString());
 }
 
@@ -1398,21 +1440,6 @@ void ModelList::handleSslErrors(QNetworkReply *reply, const QList<QSslError> &er
 void ModelList::updateDataForSettings()
 {
     emit dataChanged(index(0, 0), index(m_models.size() - 1, 0));
-}
-
-static std::strong_ordering compareVersions(const QString &a, const QString &b) {
-    QStringList aParts = a.split('.');
-    QStringList bParts = b.split('.');
-
-    for (int i = 0; i < std::min(aParts.size(), bParts.size()); ++i) {
-        int aInt = aParts[i].toInt();
-        int bInt = bParts[i].toInt();
-        if (auto diff = aInt <=> bInt; diff != 0) {
-            return diff;
-        }
-    }
-
-    return aParts.size() <=> bParts.size();
 }
 
 void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
@@ -1451,8 +1478,8 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
         QString versionRemoved = obj["removedIn"].toString();
         QString url = obj["url"].toString();
         QByteArray modelHash = obj["md5sum"].toString().toLatin1();
-        bool isDefault = obj.contains("isDefault") && obj["isDefault"] == QString("true");
-        bool disableGUI = obj.contains("disableGUI") && obj["disableGUI"] == QString("true");
+        bool isDefault = obj.contains("isDefault") && obj["isDefault"] == u"true"_s;
+        bool disableGUI = obj.contains("disableGUI") && obj["disableGUI"] == u"true"_s;
         QString description = obj["description"].toString();
         QString order = obj["order"].toString();
         int ramrequired = obj["ramrequired"].toString().toInt();
@@ -1466,11 +1493,11 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
             continue;
 
         // If the current version is strictly less than required version, then skip
-        if (!requiresVersion.isEmpty() && compareVersions(currentVersion, requiresVersion) < 0)
+        if (!requiresVersion.isEmpty() && Download::compareAppVersions(currentVersion, requiresVersion) < 0)
             continue;
 
         // If the version removed is less than or equal to the current version, then skip
-        if (!versionRemoved.isEmpty() && compareVersions(versionRemoved, currentVersion) <= 0)
+        if (!versionRemoved.isEmpty() && Download::compareAppVersions(versionRemoved, currentVersion) <= 0)
             continue;
 
         modelFilesize = ModelList::toFileSize(modelFilesize.toULongLong());
@@ -1548,7 +1575,7 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
             { ModelList::FilesizeRole, "minimal" },
             { ModelList::OnlineRole, true },
             { ModelList::DescriptionRole,
-             tr("<strong>OpenAI's ChatGPT model GPT-3.5 Turbo</strong><br>") + chatGPTDesc },
+             tr("<strong>OpenAI's ChatGPT model GPT-3.5 Turbo</strong><br> %1").arg(chatGPTDesc) },
             { ModelList::RequiresVersionRole, "2.7.4" },
             { ModelList::OrderRole, "ca" },
             { ModelList::RamrequiredRole, 0 },
@@ -1576,7 +1603,7 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
             { ModelList::FilesizeRole, "minimal" },
             { ModelList::OnlineRole, true },
             { ModelList::DescriptionRole,
-             tr("<strong>OpenAI's ChatGPT model GPT-4</strong><br>") + chatGPTDesc + chatGPT4Warn },
+             tr("<strong>OpenAI's ChatGPT model GPT-4</strong><br> %1 %2").arg(chatGPTDesc).arg(chatGPT4Warn) },
             { ModelList::RequiresVersionRole, "2.7.4" },
             { ModelList::OrderRole, "cb" },
             { ModelList::RamrequiredRole, 0 },
@@ -1587,8 +1614,8 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
         };
         updateData(id, data);
     }
-    
-	const QString mistralDesc = tr("<ul><li>Requires personal Mistral API key.</li><li>WARNING: Will send"
+
+    const QString mistralDesc = tr("<ul><li>Requires personal Mistral API key.</li><li>WARNING: Will send"
                                    " your chats to Mistral!</li><li>Your API key will be stored on disk</li><li>Will only be used"
                                    " to communicate with Mistral</li><li>You can apply for an API key"
                                    " <a href=\"https://console.mistral.ai/user/api-keys\">here</a>.</li>");
@@ -1607,7 +1634,7 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
             { ModelList::FilesizeRole, "minimal" },
             { ModelList::OnlineRole, true },
             { ModelList::DescriptionRole,
-             tr("<strong>Mistral Tiny model</strong><br>") + mistralDesc },
+             tr("<strong>Mistral Tiny model</strong><br> %1").arg(mistralDesc) },
             { ModelList::RequiresVersionRole, "2.7.4" },
             { ModelList::OrderRole, "cc" },
             { ModelList::RamrequiredRole, 0 },
@@ -1632,7 +1659,7 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
             { ModelList::FilesizeRole, "minimal" },
             { ModelList::OnlineRole, true },
             { ModelList::DescriptionRole,
-             tr("<strong>Mistral Small model</strong><br>") + mistralDesc },
+             tr("<strong>Mistral Small model</strong><br> %1").arg(mistralDesc) },
             { ModelList::RequiresVersionRole, "2.7.4" },
             { ModelList::OrderRole, "cd" },
             { ModelList::RamrequiredRole, 0 },
@@ -1643,7 +1670,7 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
         };
         updateData(id, data);
     }
-    
+
     {
         const QString modelName = "Mistral Medium API";
         const QString id = modelName;
@@ -1658,7 +1685,7 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
             { ModelList::FilesizeRole, "minimal" },
             { ModelList::OnlineRole, true },
             { ModelList::DescriptionRole,
-             tr("<strong>Mistral Medium model</strong><br>") + mistralDesc },
+             tr("<strong>Mistral Medium model</strong><br> %1").arg(mistralDesc) },
             { ModelList::RequiresVersionRole, "2.7.4" },
             { ModelList::OrderRole, "ce" },
             { ModelList::RamrequiredRole, 0 },
@@ -1670,34 +1697,30 @@ void ModelList::parseModelsJsonFile(const QByteArray &jsonData, bool save)
         updateData(id, data);
     }
 
+    const QString compatibleDesc = tr("<ul><li>Requires personal API key and the API base URL.</li>"
+                                      "<li>WARNING: Will send your chats to "
+                                      "the OpenAI-compatible API Server you specified!</li>"
+                                      "<li>Your API key will be stored on disk</li><li>Will only be used"
+                                      " to communicate with the OpenAI-compatible API Server</li>");
 
     {
-        const QString nomicEmbedDesc = tr("<ul><li>For use with LocalDocs feature</li>"
-            "<li>Used for retrieval augmented generation (RAG)</li>"
-            "<li>Requires personal Nomic API key.</li>"
-            "<li>WARNING: Will send your localdocs to Nomic Atlas!</li>"
-            "<li>You can apply for an API key <a href=\"https://atlas.nomic.ai/\">with Nomic Atlas.</a></li>");
-        const QString modelName = "Nomic Embed";
+        const QString modelName = "OpenAI-compatible";
         const QString id = modelName;
-        const QString modelFilename = "gpt4all-nomic-embed-text-v1.rmodel";
-        if (contains(modelFilename))
-            changeId(modelFilename, id);
         if (!contains(id))
             addModel(id);
         QVector<QPair<int, QVariant>> data {
             { ModelList::NameRole, modelName },
-            { ModelList::FilenameRole, modelFilename },
             { ModelList::FilesizeRole, "minimal" },
             { ModelList::OnlineRole, true },
-            { ModelList::IsEmbeddingModelRole, true },
+            { ModelList::CompatibleApiRole, true },
             { ModelList::DescriptionRole,
-             tr("<strong>LocalDocs Nomic Atlas Embed</strong><br>") + nomicEmbedDesc },
-            { ModelList::RequiresVersionRole, "2.6.3" },
-            { ModelList::OrderRole, "na" },
+             tr("<strong>Connect to OpenAI-compatible API server</strong><br> %1").arg(compatibleDesc) },
+            { ModelList::RequiresVersionRole, "2.7.4" },
+            { ModelList::OrderRole, "cf" },
             { ModelList::RamrequiredRole, 0 },
             { ModelList::ParametersRole, "?" },
             { ModelList::QuantRole, "NA" },
-            { ModelList::TypeRole, "Bert" },
+            { ModelList::TypeRole, "NA" },
         };
         updateData(id, data);
     }
@@ -1724,9 +1747,8 @@ void ModelList::updateDiscoveredInstalled(const ModelInfo &info)
 void ModelList::updateModelsFromSettings()
 {
     QSettings settings;
-    settings.sync();
     QStringList groups = settings.childGroups();
-    for (const QString g : groups) {
+    for (const QString &g: groups) {
         if (!g.startsWith("model-"))
             continue;
 
@@ -1834,6 +1856,14 @@ void ModelList::updateModelsFromSettings()
             const QString systemPrompt = settings.value(g + "/systemPrompt").toString();
             data.append({ ModelList::SystemPromptRole, systemPrompt });
         }
+        if (settings.contains(g + "/chatNamePrompt")) {
+            const QString chatNamePrompt = settings.value(g + "/chatNamePrompt").toString();
+            data.append({ ModelList::ChatNamePromptRole, chatNamePrompt });
+        }
+        if (settings.contains(g + "/suggestedFollowUpPrompt")) {
+            const QString suggestedFollowUpPrompt = settings.value(g + "/suggestedFollowUpPrompt").toString();
+            data.append({ ModelList::SuggestedFollowUpPromptRole, suggestedFollowUpPrompt });
+        }
         updateData(id, data);
     }
 }
@@ -1914,7 +1944,7 @@ void ModelList::discoverSearch(const QString &search)
 
     m_discoverNumberOfResults = 0;
     m_discoverResultsCompleted = 0;
-    discoverProgressChanged();
+    emit discoverProgressChanged();
 
     if (search.isEmpty()) {
         return;
@@ -1923,9 +1953,10 @@ void ModelList::discoverSearch(const QString &search)
     m_discoverInProgress = true;
     emit discoverInProgressChanged();
 
-    QStringList searchParams = search.split(QRegularExpression("\\s+")); // split by whitespace
-    QString searchString = QString("search=%1&").arg(searchParams.join('+'));
-    QString limitString = m_discoverLimit > 0 ? QString("limit=%1&").arg(m_discoverLimit) : QString();
+    static const QRegularExpression wsRegex("\\s+");
+    QStringList searchParams = search.split(wsRegex); // split by whitespace
+    QString searchString = u"search=%1&"_s.arg(searchParams.join('+'));
+    QString limitString = m_discoverLimit > 0 ? u"limit=%1&"_s.arg(m_discoverLimit) : QString();
 
     QString sortString;
     switch (m_discoverSort) {
@@ -1938,9 +1969,10 @@ void ModelList::discoverSearch(const QString &search)
         sortString = "sort=lastModified&"; break;
     }
 
-    QString directionString = !sortString.isEmpty() ? QString("direction=%1&").arg(m_discoverSortDirection) : QString();
+    QString directionString = !sortString.isEmpty() ? u"direction=%1&"_s.arg(m_discoverSortDirection) : QString();
 
-    QUrl hfUrl(QString("https://huggingface.co/api/models?filter=gguf&%1%2%3%4full=true&config=true").arg(searchString).arg(limitString).arg(sortString).arg(directionString));
+    QUrl hfUrl(u"https://huggingface.co/api/models?filter=gguf&%1%2%3%4full=true&config=true"_s
+               .arg(searchString, limitString, sortString, directionString));
 
     QNetworkRequest request(hfUrl);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -1966,7 +1998,7 @@ void ModelList::handleDiscoveryErrorOccurred(QNetworkReply::NetworkError code)
     QNetworkReply *reply = qobject_cast<QNetworkReply *>(sender());
     if (!reply)
         return;
-    qWarning() << QString("ERROR: Discovery failed with error code \"%1-%2\"")
+    qWarning() << u"ERROR: Discovery failed with error code \"%1-%2\""_s
                       .arg(code).arg(reply->errorString()).toStdString();
 }
 
@@ -2006,7 +2038,7 @@ void ModelList::parseDiscoveryJsonFile(const QByteArray &jsonData)
         qWarning() << "ERROR: Couldn't parse: " << jsonData << err.errorString();
         m_discoverNumberOfResults = 0;
         m_discoverResultsCompleted = 0;
-        discoverProgressChanged();
+        emit discoverProgressChanged();
         m_discoverInProgress = false;
         emit discoverInProgressChanged();
         return;
@@ -2046,7 +2078,7 @@ void ModelList::parseDiscoveryJsonFile(const QByteArray &jsonData)
         QString filename = file.second;
         ++m_discoverNumberOfResults;
 
-        QUrl url(QString("https://huggingface.co/%1/resolve/main/%2").arg(repo_id).arg(filename));
+        QUrl url(u"https://huggingface.co/%1/resolve/main/%2"_s.arg(repo_id, filename));
         QNetworkRequest request(url);
         request.setRawHeader("Accept-Encoding", "identity");
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
@@ -2085,21 +2117,16 @@ void ModelList::handleDiscoveryItemFinished()
     QJsonObject config = obj["config"].toObject();
     QString type = config["model_type"].toString();
 
-    QByteArray repoCommitHeader = reply->rawHeader("X-Repo-Commit");
+    // QByteArray repoCommitHeader = reply->rawHeader("X-Repo-Commit");
     QByteArray linkedSizeHeader = reply->rawHeader("X-Linked-Size");
     QByteArray linkedEtagHeader = reply->rawHeader("X-Linked-Etag");
     // For some reason these seem to contain quotation marks ewww
     linkedEtagHeader.replace("\"", "");
     linkedEtagHeader.replace("\'", "");
-    QString locationHeader = reply->header(QNetworkRequest::LocationHeader).toString();
-
-    QString repoCommit = QString::fromUtf8(repoCommitHeader);
-    QString linkedSize = QString::fromUtf8(linkedSizeHeader);
-    QString linkedEtag = QString::fromUtf8(linkedEtagHeader);
+    // QString locationHeader = reply->header(QNetworkRequest::LocationHeader).toString();
 
     QString modelFilename = reply->request().attribute(QNetworkRequest::UserMax).toString();
-    QString modelFilesize = linkedSize;
-    modelFilesize = ModelList::toFileSize(modelFilesize.toULongLong());
+    QString modelFilesize = ModelList::toFileSize(QString(linkedSizeHeader).toULongLong());
 
     QString description = tr("<strong>Created by %1.</strong><br><ul>"
                              "<li>Published on %2."
@@ -2156,6 +2183,6 @@ void ModelList::handleDiscoveryItemErrorOccurred(QNetworkReply::NetworkError cod
     if (!reply)
         return;
 
-    qWarning() << QString("ERROR: Discovery item failed with error code \"%1-%2\"")
+    qWarning() << u"ERROR: Discovery item failed with error code \"%1-%2\""_s
                       .arg(code).arg(reply->errorString()).toStdString();
 }

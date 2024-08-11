@@ -1,6 +1,7 @@
 #ifndef CHATLLM_H
 #define CHATLLM_H
 
+#include "database.h" // IWYU pragma: keep
 #include "modellist.h"
 
 #include "../gpt4all-backend/llmodel.h"
@@ -8,33 +9,44 @@
 #include <QByteArray>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QList>
 #include <QObject>
 #include <QPair>
 #include <QString>
 #include <QThread>
+#include <QVariantMap>
 #include <QVector>
 #include <QtGlobal>
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
-class QDataStream;
-struct ResultInfo;
-template <typename T> class QList;
+using namespace Qt::Literals::StringLiterals;
 
+class QDataStream;
+
+// NOTE: values serialized to disk, do not change or reuse
 enum LLModelType {
-    GPTJ_,
-    LLAMA_,
-    API_,
+    GPTJ_  = 0, // no longer used
+    LLAMA_ = 1,
+    API_   = 2,
+    BERT_  = 3, // no longer used
 };
+
+class ChatLLM;
 
 struct LLModelInfo {
     std::unique_ptr<LLModel> model;
     QFileInfo fileInfo;
+    std::optional<QString> fallbackReason;
+
     // NOTE: This does not store the model type or name on purpose as this is left for ChatLLM which
     // must be able to serialize the information even if it is in the unloaded state
+
+    void resetModel(ChatLLM *cllm, LLModel *model = nullptr);
 };
 
 class TokenTimer : public QObject {
@@ -68,7 +80,7 @@ private Q_SLOTS:
     void handleTimeout()
     {
         m_elapsed += m_time.restart();
-        emit report(QString("%1 tokens/sec").arg(m_tokens / float(m_elapsed / 1000.0f), 0, 'g', 2));
+        emit report(u"%1 tokens/sec"_s.arg(m_tokens / float(m_elapsed / 1000.0f), 0, 'g', 2));
     }
 
 private:
@@ -81,7 +93,10 @@ class Chat;
 class ChatLLM : public QObject
 {
     Q_OBJECT
-    Q_PROPERTY(bool isRecalc READ isRecalc NOTIFY recalcChanged)
+    Q_PROPERTY(bool restoringFromText READ restoringFromText NOTIFY restoringFromTextChanged)
+    Q_PROPERTY(QString deviceBackend READ deviceBackend NOTIFY loadedModelInfoChanged)
+    Q_PROPERTY(QString device READ device NOTIFY loadedModelInfoChanged)
+    Q_PROPERTY(QString fallbackReason READ fallbackReason NOTIFY loadedModelInfoChanged)
 public:
     ChatLLM(Chat *parent, bool isServer = false);
     virtual ~ChatLLM();
@@ -106,7 +121,31 @@ public:
     ModelInfo modelInfo() const;
     void setModelInfo(const ModelInfo &info);
 
-    bool isRecalc() const { return m_isRecalc; }
+    bool restoringFromText() const { return m_restoringFromText; }
+
+    void acquireModel();
+    void resetModel();
+
+    QString deviceBackend() const
+    {
+        if (!isModelLoaded()) return QString();
+        std::string name = LLModel::GPUDevice::backendIdToName(m_llModelInfo.model->backendName());
+        return QString::fromStdString(name);
+    }
+
+    QString device() const
+    {
+        if (!isModelLoaded()) return QString();
+        const char *name = m_llModelInfo.model->gpuDeviceName();
+        return name ? QString(name) : u"CPU"_s;
+    }
+
+    // not loaded -> QString(), no fallback -> QString("")
+    QString fallbackReason() const
+    {
+        if (!isModelLoaded()) return QString();
+        return m_llModelInfo.fallbackReason.value_or(u""_s);
+    }
 
     QString generatedName() const { return QString::fromStdString(m_nameResponse); }
 
@@ -123,6 +162,7 @@ public Q_SLOTS:
     void unloadModel();
     void reloadModel();
     void generateName();
+    void generateQuestions(qint64 elapsed);
     void handleChatIdChanged(const QString &id);
     void handleShouldBeLoadedChanged();
     void handleThreadStarted();
@@ -132,14 +172,17 @@ public Q_SLOTS:
     void processRestoreStateFromText();
 
 Q_SIGNALS:
-    void recalcChanged();
+    void restoringFromTextChanged();
+    void loadedModelInfoChanged();
     void modelLoadingPercentageChanged(float);
     void modelLoadingError(const QString &error);
     void modelLoadingWarning(const QString &warning);
     void responseChanged(const QString &response);
     void promptProcessing();
+    void generatingQuestions();
     void responseStopped(qint64 promptResponseMs);
     void generatedNameChanged(const QString &name);
+    void generatedQuestionFinished(const QString &generatedQuestion);
     void stateChanged();
     void threadStarted();
     void shouldBeLoadedChanged();
@@ -158,16 +201,14 @@ protected:
         int32_t repeat_penalty_tokens);
     bool handlePrompt(int32_t token);
     bool handleResponse(int32_t token, const std::string &response);
-    bool handleRecalculate(bool isRecalc);
     bool handleNamePrompt(int32_t token);
     bool handleNameResponse(int32_t token, const std::string &response);
-    bool handleNameRecalculate(bool isRecalc);
     bool handleSystemPrompt(int32_t token);
     bool handleSystemResponse(int32_t token, const std::string &response);
-    bool handleSystemRecalculate(bool isRecalc);
     bool handleRestoreStateFromTextPrompt(int32_t token);
     bool handleRestoreStateFromTextResponse(int32_t token, const std::string &response);
-    bool handleRestoreStateFromTextRecalculate(bool isRecalc);
+    bool handleQuestionPrompt(int32_t token);
+    bool handleQuestionResponse(int32_t token, const std::string &response);
     void saveState();
     void restoreState();
 
@@ -177,8 +218,11 @@ protected:
     quint32 m_promptResponseTokens;
 
 private:
+    bool loadNewModel(const ModelInfo &modelInfo, QVariantMap &modelLoadProps);
+
     std::string m_response;
     std::string m_nameResponse;
+    QString m_questionResponse;
     LLModelInfo m_llModelInfo;
     LLModelType m_llModelType;
     ModelInfo m_modelInfo;
@@ -187,7 +231,7 @@ private:
     QThread m_llmThread;
     std::atomic<bool> m_stopGenerating;
     std::atomic<bool> m_shouldBeLoaded;
-    std::atomic<bool> m_isRecalc;
+    std::atomic<bool> m_restoringFromText; // status indication
     std::atomic<bool> m_forceUnloadModel;
     std::atomic<bool> m_markedForDeletion;
     bool m_isServer;
